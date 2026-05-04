@@ -1203,7 +1203,282 @@ socket.on("domainInfo", (monitorID, daysRemaining, expiresOn) => {
 2. **统计数据完整**：`sendStats` 会推送最新的计算好的统计数据
 3. **状态最终一致**：前端通过 `lastHeartbeatList` 计算属性获取最新状态
 
-### 6.6 主动刷新机制
+### 6.6 鉴权失败分支
+
+当断线重连或正常连接时，可能会遇到鉴权失败的情况。以下是不同场景的处理逻辑：
+
+#### 6.6.1 Token 失效场景
+
+**失效原因**：
+1. JWT 自然过期（默认 30 天）
+2. 用户修改了密码
+3. 用户被禁用或删除
+4. JWT 被篡改或格式错误
+
+**后端验证逻辑**：
+
+```javascript
+// server/server.js:383-430
+socket.on("loginByToken", async (token, callback) => {
+    try {
+        // 1. 验证 JWT 签名和过期时间
+        let decoded = jwt.verify(token, server.jwtSecret);
+        
+        // 2. 验证用户是否存在且活跃
+        let user = await R.findOne("user", " username = ? AND active = 1 ", [decoded.username]);
+        
+        if (user) {
+            // 3. 检查密码是否变更（关键安全机制）
+            // JWT payload 中的 h 字段是密码的 SHAKE256 哈希
+            if (decoded.h !== shake256(user.password, SHAKE256_LENGTH)) {
+                throw new Error("The token is invalid due to password change or old token");
+            }
+            
+            // 验证成功
+            await afterLogin(socket, user);
+            callback({ ok: true });
+        } else {
+            // 用户不存在或被禁用
+            callback({
+                ok: false,
+                msg: "authUserInactiveOrDeleted",  // "该用户被禁用或删除"
+                msgi18n: true,
+            });
+        }
+    } catch (error) {
+        // JWT 验证失败（过期、篡改、格式错误）
+        callback({
+            ok: false,
+            msg: "authInvalidToken",  // "无效的令牌"
+            msgi18n: true,
+        });
+    }
+});
+```
+
+#### 6.6.2 前端处理逻辑
+
+前端在 `loginByToken` 失败时会主动执行登出：
+
+```javascript
+// src/mixins/socket.js:445-456
+loginByToken(token) {
+    socket.emit("loginByToken", token, (res) => {
+        this.allowLoginDialog = true;  // 显示登录对话框
+        
+        if (!res.ok) {
+            // 鉴权失败：执行登出
+            this.logout();
+        } else {
+            this.loggedIn = true;
+            this.username = this.getJWTPayload()?.username;
+        }
+    });
+},
+```
+
+#### 6.6.3 登出流程
+
+```javascript
+// src/mixins/socket.js:462-469
+logout() {
+    // 1. 通知服务端登出
+    socket.emit("logout", () => {});
+    
+    // 2. 清除本地存储的 token
+    this.storage().removeItem("token");
+    this.socket.token = null;
+    
+    // 3. 更新登录状态
+    this.loggedIn = false;
+    this.username = null;
+    
+    // 4. 清空所有状态数据
+    this.clearData();
+},
+```
+
+#### 6.6.4 完整鉴权失败流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    断线重连鉴权失败流程                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  连接断开                                                                     │
+│     ↓                                                                        │
+│  Socket.IO 自动重连                                                          │
+│     ↓                                                                        │
+│  连接成功 (connectCount >= 2)                                               │
+│     ↓                                                                        │
+│  前端执行 clearData() → 清空心跳列表                                         │
+│     ↓                                                                        │
+│  服务端发送 loginRequired                                                    │
+│     ↓                                                                        │
+│  前端读取 localStorage.token                                                 │
+│     ↓                                                                        │
+│  调用 loginByToken(token)                                                    │
+│     ↓                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                     服务端 Token 验证                                   │  │
+│  ├──────────────────────────────────────────────────────────────────────┤  │
+│  │  1. jwt.verify() 验证签名和过期时间                                     │  │
+│  │     └─失败 → 抛出错误 → authInvalidToken                               │  │
+│  │  2. 验证用户是否存在且 active=1                                         │  │
+│  │     └─失败 → authUserInactiveOrDeleted                                 │  │
+│  │  3. 验证 decoded.h === shake256(user.password)                        │  │
+│  │     └─失败 → 密码已变更 → authInvalidToken                              │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│     ↓                                                                        │
+│  ┌──────────────────────┐         ┌──────────────────────┐                │
+│  │     验证成功         │         │     验证失败         │                │
+│  │    res.ok = true    │         │    res.ok = false   │                │
+│  └──────────┬───────────┘         └──────────┬───────────┘                │
+│             ↓                                  ↓                             │
+│  执行 afterLogin()                  执行 this.logout()                      │
+│     ↓                                  ↓                                      │
+│  推送所有状态数据                   清除 token + 状态数据                      │
+│     ↓                                  ↓                                      │
+│  UI 正常展示                       显示登录对话框                              │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.7 哪些状态不会补齐
+
+当断线重连或鉴权失败时，部分状态数据可能无法完全恢复：
+
+#### 6.7.1 不会自动补齐的状态
+
+| 数据类型 | 说明 | 影响 |
+|---------|------|------|
+| **实时心跳事件流** | 断线期间的 `heartbeat` 事件不会重放 | 断线期间的 Toast 通知丢失 |
+| **事件总线触发** | `emitter.emit("newImportantHeartbeat")` 不会重放 | 依赖事件总线的组件可能错过通知 |
+| **心跳列表长度** | 只推送最近 100 条，更早的历史不会补齐 | 长断线后历史图表不完整 |
+| **本地操作状态** | 前端本地的 UI 状态（如展开的菜单、滚动位置）不会保存 | 页面刷新效果 |
+
+#### 6.7.2 会完整补齐的状态
+
+| 数据类型 | 补齐方式 | 说明 |
+|---------|---------|------|
+| **监控列表** | `monitorList` 事件 | 全量推送所有监控配置 |
+| **心跳历史** | `heartbeatList` 事件 | 推送最近 100 条心跳 |
+| **统计数据** | `avgPing` / `uptime` 等 | 推送计算好的最新统计 |
+| **配置数据** | `notificationList` / `proxyList` 等 | 全量推送所有配置 |
+| **最新状态** | `lastHeartbeatList` 计算属性 | 从心跳历史派生出最新状态 |
+
+#### 6.7.3 状态一致性保证
+
+虽然部分实时事件丢失，但**最终状态一致性**得到保证：
+
+1. **数据库是真相源**：所有心跳数据存储在数据库中
+2. **重连时从数据库恢复**：`sendHeartbeatList` 从数据库查询最近 100 条
+3. **统计数据实时计算**：`sendStats` 从 `UptimeCalculator` 获取最新计算结果
+4. **前端计算属性派生**：`statusList`、`stats` 等从原始数据动态计算
+
+### 6.8 多连接状态一致性保证
+
+当用户在多个浏览器标签页打开 Uptime Kuma 时，需要保证多连接间的状态一致性。
+
+#### 6.8.1 房间机制的一致性保证
+
+```javascript
+// server/server.js:1804-1806
+async function afterLogin(socket, user) {
+    socket.userID = user.id;
+    socket.join(user.id);  // 所有同一用户的连接都加入同一个房间
+}
+```
+
+**广播方式**：
+```javascript
+// 向该用户的所有连接广播
+io.to(this.user_id).emit("heartbeat", bean.toJSON());
+io.to(userID).emit("avgPing", monitorID, data);
+```
+
+**效果**：
+- 所有标签页同时收到相同的心跳事件
+- 状态变更在所有窗口同步展示
+- 实时推送保证了多窗口的最终一致性
+
+#### 6.8.2 强制刷新机制（密码变更场景）
+
+当用户修改密码时，需要强制其他连接下线，防止旧 token 继续使用：
+
+```javascript
+// server/uptime-kuma-server.js:548-557
+disconnectAllSocketClients(userID, currentSocketID) {
+    // 遍历所有连接
+    for (const socket of this.io.sockets.sockets.values()) {
+        // 找到同一用户的其他连接（排除当前操作的连接）
+        if (socket.userID === userID && socket.id !== currentSocketID) {
+            try {
+                socket.emit("refresh");  // 发送刷新事件
+                socket.disconnect();      // 强制断开
+            } catch (e) {}
+        }
+    }
+}
+```
+
+**前端接收**：
+```javascript
+// src/mixins/socket.js:299-301
+socket.on("refresh", () => {
+    location.reload();  // 整页刷新
+});
+```
+
+#### 6.8.3 触发强制刷新的场景
+
+| 场景 | 调用位置 | 目的 |
+|------|---------|------|
+| **修改密码** | `server.js:1437` | 防止旧 token 继续有效 |
+| **启用认证** | `server.js:1492` | 防止无认证状态的连接继续存在 |
+| **主动登出其他连接** | `general-socket-handler.js:139` | 用户主动管理多连接 |
+
+#### 6.8.4 强制刷新后的状态处理
+
+当某个连接被强制刷新后：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    多连接强制刷新流程                                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  用户 A 在标签页 1 修改密码                                                │
+│     ↓                                                                   │
+│  标签页 1 生成新 token，保持连接                                           │
+│     ↓                                                                   │
+│  调用 disconnectAllSocketClients(userID, currentSocketID)               │
+│     ↓                                                                   │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  标签页 2：                                                         │  │
+│  │    1. 收到 "refresh" 事件                                           │  │
+│  │    2. 执行 location.reload()                                        │  │
+│  │    3. 页面刷新，所有状态丢失                                         │  │
+│  │    4. 重新加载应用，检查 localStorage.token                          │  │
+│  │    5. 使用旧 token 尝试登录                                          │  │
+│  │    6. 服务端检测到密码已变更 → authInvalidToken                       │  │
+│  │    7. 前端执行 logout() → 清除旧 token + 显示登录对话框                │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│     ↓                                                                   │
+│  标签页 2 需要重新输入用户名密码登录                                        │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 6.8.5 多连接一致性总结
+
+| 机制 | 实现方式 | 效果 |
+|------|---------|------|
+| **房间广播** | `socket.join(userID)` + `io.to(userID).emit()` | 实时事件同步到所有连接 |
+| **数据库真相源** | 所有状态从数据库查询 | 重连后状态完全恢复 |
+| **计算属性派生** | `lastHeartbeatList`、`statusList` | 无需额外同步，自动一致 |
+| **强制刷新** | `disconnectAllSocketClients()` + `refresh` 事件 | 密码变更时保证安全 |
+
+### 6.9 主动刷新机制
 
 服务器可以强制客户端刷新：
 
@@ -1214,7 +1489,7 @@ socket.on("refresh", () => {
 });
 
 // 应用场景：修改密码时，强制其他连接刷新
-// server/server.js:548-557
+// server/uptime-kuma-server.js:548-557
 disconnectAllSocketClients(userID, currentSocketID) {
     for (const socket of this.io.sockets.sockets.values()) {
         if (socket.userID === userID && socket.id !== currentSocketID) {
@@ -1337,12 +1612,15 @@ disconnectAllSocketClients(userID, currentSocketID) {
 
 ---
 
-## 7. 参考文件
+## 8. 参考文件
 
 | 文件路径 | 说明 |
 |---------|------|
 | `server/uptime-kuma-server.js` | Socket.IO 服务初始化、房间管理、监控列表推送 |
-| `server/server.js` | 连接处理、认证逻辑、登录流程、事件处理器注册 |
+| `server/server.js` | 连接处理、认证逻辑、登录流程、事件处理器注册、afterLogin 状态补齐 |
+| `server/model/monitor.js` | 监控核心实现、状态产生、心跳广播、sendStats 统计推送 |
 | `server/util-server.js` | `checkLogin` 权限检查、JWT 相关工具 |
 | `server/client.js` | 各类数据推送函数（heartbeatList、notificationList 等） |
-| `src/mixins/socket.js` | 前端 Socket.IO 客户端、事件监听、响应式数据 |
+| `server/routers/api-router.js` | Push 类型监控的 API 心跳接收与广播 |
+| `src/mixins/socket.js` | 前端 Socket.IO 客户端、事件监听、响应式数据、断线重连处理 |
+| `src/util.ts` | 状态常量定义（UP、DOWN、PENDING、MAINTENANCE） |
