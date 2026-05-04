@@ -3,9 +3,12 @@
 ## 目录
 
 1. [监控任务调度机制](#1-监控任务调度机制)
-2. [Heartbeat 状态更新与判定](#2-heartbeat-状态更新与判定)
-3. [重要心跳与通知机制](#3-重要心跳与通知机制)
-4. [Uptime 计算与统计](#4-uptime-计算与统计)
+2. [请求参数解析与校验](#2-请求参数解析与校验)
+3. [Heartbeat 状态更新与判定](#3-heartbeat-状态更新与判定)
+4. [重要心跳与通知机制](#4-重要心跳与通知机制)
+5. [Uptime 计算与统计写入](#5-uptime-计算与统计写入)
+6. [完整时序图](#6-完整时序图)
+7. [附录：关键代码位置速查表](#7-附录关键代码位置速查表)
 
 ---
 
@@ -13,11 +16,7 @@
 
 ### 1.1 核心调度器
 
-监控任务的调度核心位于 `server/model/monitor.js` 中的 `start()` 方法。Uptime Kuma 采用**递归 setTimeout 而非 setInterval 进行调度，以确保每次监控检查完成后再计算下一次执行时间。
-
-```javascript
-// server/model/monitor.js:409-1149
-```
+监控任务的调度核心位于 `server/model/monitor.js` 中的 `start()` 方法。Uptime Kuma 采用**递归 setTimeout** 而非 setInterval 进行调度，以确保每次监控检查完成后再计算下一次执行时间。
 
 ### 1.2 调度流程
 
@@ -40,8 +39,6 @@
 
 #### 1.2.2 调度间隔计算
 
-下一次调度时间通过以下公式计算：
-
 ```javascript
 // server/model/monitor.js:1112
 let intervalRemainingMs = Math.max(1, beatInterval * 1000 - dayjs().diff(dayjs.utc(bean.time)));
@@ -55,235 +52,362 @@ let intervalRemainingMs = Math.max(1, beatInterval * 1000 - dayjs().diff(dayjs.u
 | PENDING | `this.retryInterval`（如果 > 0） | 重试间隔，优先使用 `retryInterval` |
 | PENDING | `this.interval` | 重试间隔，未设置 `retryInterval` 时使用默认间隔 |
 
-### 1.3 特殊监控类型调度
+### 1.3 Push 类型监控
 
-#### 1.3.1 Push 类型监控
-
-Push 类型监控有特殊的调度逻辑：
-
-```javascript
-// server/model/monitor.js:1141-1148
-// Delay Push Type
-if (this.type === "push") {
-    setTimeout(() => {
-        safeBeat();
-    }, this.interval * 1000);
-} else {
-    safeBeat();
-}
-```
-
-**Push 类型特点**：
+Push 类型有特殊的调度逻辑：
 - 启动时延迟 `interval * 1000` 毫秒后开始第一次检查
 - 检查逻辑：判断是否在时间窗口内收到心跳
 - 时间窗口计算：`beatInterval * 1000 + bufferTime`（bufferTime = 1000ms）
 
-**Push 类型心跳检查逻辑**：
+---
+
+## 2. 请求参数解析与校验
+
+### 2.1 HTTP 类型参数解析
+
+HTTP 类型（包括 http、keyword、json-query）的参数解析在 `server/model/monitor.js` 的 `beat()` 函数中进行。
+
+#### 2.1.1 参数解析流程
+
+1. **基础超时处理**：
+   - 如果 `timeout <= 0`，设置为 `interval * 1000 * 0.8`
+
+2. **认证方式处理**：
+   - **Basic Auth**：构建 `Authorization: Basic ...` 头
+   - **OAuth2 Client Credentials**：自动获取/刷新 token，构建 `Authorization: Bearer ...` 头
+
+3. **IP 协议族选择**：
+   - `ipFamily = "ipv4"` → `agentFamily = 4`
+   - `ipFamily = "ipv6"` → `agentFamily = 6`
+
+4. **请求 Body 解析与校验**：
+   - **JSON 格式（默认）**：尝试 `JSON.parse()`，失败抛出错误
+   - **Form 格式**：直接使用原始字符串，`Content-Type: application/x-www-form-urlencoded`
+   - **XML 格式**：直接使用原始字符串，`Content-Type: text/xml; charset=utf-8`
+
+5. **Axios 选项构建**：
+   - `validateStatus` 自定义函数，使用 `checkStatusCode()` 校验
+
+6. **代理配置**：
+   - 加载 proxy 配置，创建自定义 HTTP/HTTPS Agent
+   - 禁用 Axios 内置代理
+
+7. **mTLS 配置**：
+   - 将 `tlsCert`、`tlsCa`、`tlsKey` 转为 Buffer 后设置到 Agent
+
+### 2.2 状态码校验机制
+
+#### 2.2.1 `checkStatusCode` 函数
 
 ```javascript
-// server/model/monitor.js:726-763
-} else if (this.type === "push") {
-    const bufferTime = 1000;
-    
-    if (previousBeat) {
-        const msSinceLastBeat = dayjs.utc().valueOf() - dayjs.utc(previousBeat.time).valueOf();
-        
-        // 如果上一次心跳状态不是 UP（考虑 upsideDown 模式）
-        // 或者超过时间窗口
-        if (
-            previousBeat.status !== (this.isUpsideDown() ? DOWN : UP) ||
-            msSinceLastBeat > beatInterval * 1000 + bufferTime
-        ) {
-            bean.duration = Math.round(msSinceLastBeat / 1000);
-            throw new Error("No heartbeat in the time window");
-        } else {
-            // 在时间窗口内，调整下一次超时时间
-            let timeout = beatInterval * 1000 - msSinceLastBeat;
-            if (timeout < 0) {
-                timeout = bufferTime;
-            } else {
-                timeout += bufferTime;
-            }
-            // 不需要插入成功的心跳记录
-            retries = 0;
-            this.heartbeatInterval = setTimeout(safeBeat, timeout);
-            return;
-        }
-    } else {
-        // 第一次检查，没有历史心跳
-        bean.duration = beatInterval;
-        throw new Error("No heartbeat in the time window");
+// server/util-server.js:552-585
+exports.checkStatusCode = function (status, acceptedCodes) {
+    if (acceptedCodes == null || acceptedCodes.length === 0) {
+        return false;
     }
-}
+
+    for (const codeRange of acceptedCodes) {
+        const codeRangeSplit = codeRange.split("-").map((string) => parseInt(string));
+        
+        // 单个状态码，如 "200"
+        if (codeRangeSplit.length === 1) {
+            if (status === codeRangeSplit[0]) {
+                return true;
+            }
+        } 
+        // 状态码范围，如 "200-299"
+        else {
+            if (status >= codeRangeSplit[0] && status <= codeRangeSplit[1]) {
+                return true;
+            }
+        }
+    }
+    
+    return false;
+};
 ```
 
-#### 1.3.2 其他监控类型
+#### 2.2.2 状态码校验规则
 
-其他类型（HTTP、Ping、Docker 等）立即开始第一次检查，然后根据检查结果决定下一次调度时间。
+| 配置格式 | 示例 | 说明 |
+|---------|------|------|
+| 单个状态码 | `"200"` | 精确匹配 |
+| 状态码范围 | `"200-299"` | 区间匹配（包含边界） |
+| 多个规则 | `["200", "400-404"]` | 任一匹配即通过 |
 
-### 1.4 停止监控
+**默认配置**：通常为 `["200-299"]`，表示所有 2xx 状态码都视为成功。
+
+#### 2.2.3 在 Axios 中的使用
 
 ```javascript
-// server/model/monitor.js:1245-1250
-async stop() {
-    clearTimeout(this.heartbeatInterval);
-    this.isStop = true;
-    this.prometheus?.remove();
-}
+// server/model/monitor.js:557-559
+validateStatus: (status) => {
+    return checkStatusCode(status, this.getAcceptedStatuscodes());
+},
 ```
+
+**工作原理**：
+- Axios 默认将 2xx 状态码视为成功，其他状态码抛出错误
+- 通过 `validateStatus` 自定义成功判定逻辑
+- 如果 `checkStatusCode` 返回 `true`，Axios 认为请求成功
+- 如果返回 `false`，Axios 抛出错误，进入 catch 块
 
 ---
 
-## 2. Heartbeat 状态更新与判定
+## 3. Heartbeat 状态更新与判定
 
-### 2.1 状态常量定义
-
-状态常量定义在 `src/util.js` 中：
+### 3.1 状态常量定义
 
 ```javascript
 // src/util.js:21-24
 DOWN = 0;       // 服务不可用
-UP = 1;           // 服务正常
-PENDING = 2;      // 重试中/待确认
-MAINTENANCE = 3;  // 维护模式
+UP = 1;         // 服务正常
+PENDING = 2;    // 重试中/待确认
+MAINTENANCE = 3; // 维护模式
 ```
 
-### 2.2 状态更新流程
+### 3.2 完整状态判定流程
 
-#### 2.2.1 初始状态设置
+#### 3.2.1 状态判定六阶段
 
-每次心跳开始时，创建一个新的 heartbeat bean，默认状态为 `DOWN`：
+**阶段 1：初始化状态（初始翻转）**
 
 ```javascript
-// server/model/monitor.js:448-456
-let bean = R.dispense("heartbeat");
-bean.monitor_id = this.id;
-bean.time = R.isoDateTimeMillis(dayjs.utc());
 bean.status = DOWN;  // 默认状态
-bean.downCount = previousBeat?.downCount || 0;
 
 if (this.isUpsideDown()) {
-    bean.status = flipStatus(bean.status);  // 翻转状态
+    bean.status = flipStatus(bean.status);  // DOWN → UP
 }
 ```
 
-#### 2.2.2 维护状态检测
+注意：此处翻转是为了后续逻辑的一致性，真正的状态判定在检查完成后进行。
 
-在执行任何检查之前，先检测是否处于维护模式：
+**阶段 2：维护模式检测**
 
 ```javascript
-// server/model/monitor.js:465-467
 if (await Monitor.isUnderMaintenance(this.id)) {
     bean.msg = "Monitor under maintenance";
-    bean.status = MAINTENANCE;
+    bean.status = MAINTENANCE;  // 直接设为维护状态
+    // 跳过实际监控检查
 }
 ```
 
-**维护状态检测逻辑**（`server/model/monitor.js:1630-1652`）：
-- 检查当前监控是否关联了维护计划
-- 检查父级监控是否处于维护模式（继承维护状态）
+维护状态检测逻辑：
+1. 检查当前监控是否关联了维护计划
+2. 检查父级监控是否处于维护模式（继承维护状态）
 
-#### 2.2.3 监控类型检查
+**阶段 3：执行监控检查**
 
-根据监控类型执行不同的检查逻辑：
+根据监控类型执行不同检查：
+- **HTTP 类型**：状态码校验 → 关键字检查 → JSON查询 → 设为 UP
+- **Ping 类型**：ICMP Ping → 计算延迟 → 设为 UP
+- **插件类型**：调用插件 → 获取状态 → 设为 UP
 
-| 监控类型 | 检查方式 | 状态设置 |
-|----------|----------|--------|
-| http | HTTP 请求 | 状态码验证通过 → UP |
-| keyword | HTTP 请求 + 关键字匹配 | 关键字匹配 → UP |
-| json-query | HTTP 请求 + JSONPath 查询 | 查询条件满足 → UP |
-| ping | ICMP Ping | Ping 成功 → UP |
-| push | 时间窗口检查 | 收到心跳 → UP |
-| docker | Docker API | 容器运行中 → UP |
-| steam | Steam API | 服务器在线 → UP |
-| radius | Radius 认证 | 认证成功 → UP |
-| 其他插件类型 | 插件自定义检查 | 插件返回 UP |
+成功：设置 `bean.status = UP`
+失败：抛出错误 → 进入 catch 块
 
-#### 2.2.4 Upside Down 模式
-
-Upside Down 模式会翻转状态判断：
+**阶段 4：检查后翻转（Upside Down 模式）**
 
 ```javascript
-// server/model/monitor.js:940-946
 if (this.isUpsideDown()) {
     bean.status = flipStatus(bean.status);
 
     if (bean.status === DOWN) {
+        // 翻转后变为 DOWN，抛出错误
+        // 这样会进入 catch 块，触发重试逻辑
         throw new Error("Flip UP to DOWN");
     }
 }
 ```
 
-**翻转逻辑**（`src/util.js:116-124`）：
-- UP → DOWN
-- DOWN → UP
-- 其他状态保持不变
+**翻转逻辑（`flipStatus`）**：
+- UP ↔ DOWN
+- PENDING、MAINTENANCE 保持不变
 
-### 2.3 重试机制
+**目的**：
+- 正常检查成功（UP）→ 翻转后变为 DOWN → 抛出错误 → 视为"故障"
+- 正常检查失败（DOWN）→ 翻转后变为 UP → 视为"正常"
+- 适用于监控"故障场景"，例如监控某个服务是否已停止
 
-当监控检查失败时，会进入重试逻辑：
+**阶段 5：异常处理与重试机制（catch 块）**
 
 ```javascript
-// server/model/monitor.js:980-990
+catch (error) {
+    // 1. 设置错误消息
+    if (error?.name === "CanceledError") {
+        bean.msg = `timeout by AbortSignal (${this.timeout}s)`;
+    } else {
+        bean.msg = error.message;
+    }
+
+    // 2. 保存错误响应（如果启用）
+    if (this.getSaveErrorResponse() && error?.response?.data !== undefined) {
+        await this.saveResponseData(bean, error.response.data);
+    }
+
+    // 3. 状态判定
+    
+    // 情况 A: Upside Down 模式且当前状态是 UP
+    // 这意味着原本是 DOWN，翻转后变为 UP，不需要重试
+    if (this.isUpsideDown() && bean.status === UP) {
+        retries = 0;  // 重置重试计数
+    }
+    
+    // 情况 B: JSON Query 类型的特殊处理
+    else if (this.type === "json-query" && this.retry_only_on_status_code_failure) {
+        const isJsonQueryError =
+            typeof error.message === "string" && 
+            error.message.includes("JSON query does not pass");
+
+        if (isJsonQueryError) {
+            // JSON 查询失败不重试，立即标记为 DOWN
+            retries = 0;
+        } else if (this.maxretries > 0 && retries < this.maxretries) {
+            // 网络错误（状态码错误）：正常重试
+            retries++;
+            bean.status = PENDING;
+        } else {
+            // 超过最大重试次数：保持 DOWN
+            retries++;
+        }
+    }
+    
+    // 情况 C: 通用重试逻辑（所有其他类型）
+    else {
+        if (this.maxretries > 0 && retries < this.maxretries) {
+            retries++;
+            bean.status = PENDING;
+        } else {
+            // 超过最大重试次数：保持 DOWN
+            retries++;
+        }
+    }
+}
+```
+
+**阶段 6：最终状态确定**
+
+```javascript
+bean.retries = retries;  // 保存当前重试次数
+```
+
+此时 `bean.status` 可能的值：
+- **UP**：检查成功，或 Upside Down 模式下检查失败
+- **DOWN**：检查失败且无需重试，或超过最大重试次数
+- **PENDING**：检查失败但可重试
+- **MAINTENANCE**：处于维护模式
+
+#### 3.2.2 状态判定决策表
+
+**正常模式（非 Upside Down）**：
+
+| 检查结果 | maxretries | retries 状态 | 最终状态 | 说明 |
+|---------|------------|-------------|---------|------|
+| 成功 | 任意 | 任意 | UP | 直接成功 |
+| 失败 | 0 | 0 | DOWN | 不重试，直接失败 |
+| 失败 | 3 | 0 | PENDING | 第1次重试 |
+| 失败 | 3 | 1 | PENDING | 第2次重试 |
+| 失败 | 3 | 2 | PENDING | 第3次重试 |
+| 失败 | 3 | 3 | DOWN | 超过重试次数，确认失败 |
+
+**Upside Down 模式**：
+
+| 原始检查结果 | 翻转后状态 | 行为 | 说明 |
+|-------------|-----------|------|------|
+| 成功 (UP) | DOWN | 抛出错误，进入 catch | 视为"失败" |
+| 失败 (DOWN) | UP | 正常继续，不重试 | 视为"成功" |
+
+**注意**：Upside Down 模式下：
+- `maxretries` 和重试机制仍然有效
+- 如果原始检查成功（翻转后为 DOWN），会触发重试逻辑
+- 如果原始检查失败（翻转后为 UP），不会触发重试
+
+### 3.3 重试机制详解
+
+#### 3.3.1 重试计数器生命周期
+
+1. **初始化阶段**：
+   ```javascript
+   let retries = 0;
+   // 如果有历史心跳，恢复重试计数
+   if (previousBeat) {
+       retries = previousBeat.retries;  // 恢复
+   }
+   ```
+
+2. **成功时重置**：
+   ```javascript
+   // try 块中，检查成功后
+   retries = 0;  // 重置重试计数
+   ```
+
+3. **失败时递增**：
+   ```javascript
+   // catch 块中
+   if (this.maxretries > 0 && retries < this.maxretries) {
+       retries++;                   // 递增
+       bean.status = PENDING;        // 设为 PENDING
+   } else {
+       retries++;                   // 继续递增（即使 DOWN）
+   }
+   
+   // 保存到 heartbeat bean
+   bean.retries = retries;
+   ```
+
+4. **持久化存储**：
+   ```javascript
+   // 心跳记录存储到数据库
+   await R.store(bean);  // retries 字段被持久化
+   
+   // 下次启动时恢复
+   previousBeat = await R.findOne(...);
+   retries = previousBeat.retries;
+   ```
+
+#### 3.3.2 PENDING 状态的特殊性质
+
+**PENDING 状态与 UP/DOWN 的区别**：
+
+| 特性 | PENDING | UP | DOWN |
+|-----|---------|-----|------|
+| 是否触发通知 | 否 | 状态变化时 | 状态变化时 |
+| 是否计入 Uptime | 视为 DOWN | 视为 UP | 视为 DOWN |
+| 是否影响重试间隔 | 是（使用 retryInterval） | 否 | 否 |
+| 是否显示为"重要"心跳 | 否（除非 PENDING→DOWN） | 状态变化时是 | 状态变化时是 |
+
+**PENDING 状态的调度间隔**：
+
+```javascript
+// server/model/monitor.js:1070-1073
+} else if (bean.status === PENDING) {
+    if (this.retryInterval > 0) {
+        beatInterval = this.retryInterval;  // 使用重试间隔
+    }
+}
+```
+
+**PENDING → DOWN 的转换条件**：
+
+```javascript
+// 条件：retries >= maxretries
+if (this.maxretries > 0 && retries < this.maxretries) {
+    // 继续重试，保持 PENDING
 } else {
-    // 通用重试逻辑适用于所有其他监控类型
-    if (this.maxretries > 0 && retries < this.maxretries) {
-        retries++;
-        bean.status = PENDING;
-    } else {
-        // 继续计数重试次数（即使处于 DOWN 状态）
-        retries++;
-    }
+    // 超过重试次数，变为 DOWN
+    // retries 继续递增，但状态不再改变
 }
 ```
-
-#### 2.3.1 重试规则
-
-| 条件 | 结果 |
-|------|------|
-| `maxretries > 0` 且 `retries < maxretries` | 状态设为 PENDING，继续重试 |
-| `maxretries = 0` | 直接标记为 DOWN，不重试 |
-| `retries >= maxretries` | 标记为 DOWN，停止重试 |
-
-#### 2.3.2 JSON Query 特殊处理
-
-JSON Query 类型有特殊的重试选项：
-
-```javascript
-// server/model/monitor.js:964-980
-} else if (this.type === "json-query" && this.retry_only_on_status_code_failure) {
-    // 对于启用了 retry_only_on_status_code_failure 的 json-query 监控
-    // 仅在错误不是来自 JSON 查询评估时重试
-    // JSON 查询错误的消息包含 "JSON query does not pass..."
-    const isJsonQueryError =
-        typeof error.message === "string" && error.message.includes("JSON query does not pass");
-
-    if (isJsonQueryError) {
-        // JSON 查询失败不重试，立即标记为 DOWN
-        retries = 0;
-    } else if (this.maxretries > 0 && retries < this.maxretries) {
-        retries++;
-        bean.status = PENDING;
-    } else {
-        retries++;
-    }
-}
-```
-
-**规则**：
-- 如果 `retry_only_on_status_code_failure = true`：
-  - 网络错误（状态码错误）：正常重试
-  - JSON 查询错误：不重试，直接标记为 DOWN
 
 ---
 
-## 3. 重要心跳与通知机制
+## 4. 重要心跳与通知机制
 
-### 3.1 重要心跳判定
+### 4.1 重要心跳判定
 
 重要心跳（Important Beat）是指状态发生变化的心跳，会触发特殊处理。
 
-#### 3.1.1 `isImportantBeat()` 方法
+#### 4.1.1 `isImportantBeat()` 方法
 
 ```javascript
 // server/model/monitor.js:1419-1445
@@ -301,7 +425,7 @@ static isImportantBeat(isFirstBeat, previousBeatStatus, currentBeatStatus) {
 }
 ```
 
-#### 3.1.2 重要心跳状态转换表
+#### 4.1.2 重要心跳状态转换表
 
 | 前状态 | 后状态 | 是否重要 | 说明 |
 |--------|--------|---------|------|
@@ -313,7 +437,6 @@ static isImportantBeat(isFirstBeat, previousBeatStatus, currentBeatStatus) {
 | PENDING | PENDING | ❌ 否 | 重试中 |
 | PENDING | DOWN | ✅ 是 | 重试失败，确认 DOWN |
 | PENDING | UP | ❌ 否 | 重试成功恢复 |
-| DOWN | PENDING | 不存在 | DOWN 后不会变为 PENDING |
 | DOWN | DOWN | ❌ 否 | 持续 DOWN |
 | DOWN | UP | ✅ 是 | 服务恢复 |
 | DOWN | MAINTENANCE | ✅ 是 | 进入维护模式 |
@@ -321,7 +444,7 @@ static isImportantBeat(isFirstBeat, previousBeatStatus, currentBeatStatus) {
 | MAINTENANCE | UP | ✅ 是 | 维护结束恢复 |
 | MAINTENANCE | DOWN | ✅ 是 | 维护结束但服务 DOWN |
 
-### 3.2 通知触发判定
+### 4.2 通知触发判定
 
 通知触发判定比重要心跳判定更严格：
 
@@ -338,7 +461,7 @@ static isImportantForNotification(isFirstBeat, previousBeatStatus, currentBeatSt
 }
 ```
 
-#### 3.2.1 通知触发状态转换表
+#### 4.2.1 通知触发状态转换表
 
 | 前状态 | 后状态 | 是否触发通知 | 说明 |
 |--------|--------|-------------|------|
@@ -353,9 +476,45 @@ static isImportantForNotification(isFirstBeat, previousBeatStatus, currentBeatSt
 - 进入维护模式（任意状态 → MAINTENANCE）**不触发通知**
 - 从维护模式恢复到 UP（MAINTENANCE → UP）**不触发通知**
 
-### 3.3 持续 DOWN 重发通知
+### 4.3 通知触发流程
 
-当服务持续 DOWN 时，可以设置重发通知：
+#### 4.3.1 通知触发时序
+
+```
+阶段 1: 重要心跳判定
+  let isImportant = Monitor.isImportantBeat(isFirstBeat, previousBeat?.status, bean.status);
+
+阶段 2: 分支处理
+
+  分支 A: isImportant = true
+    2a. 标记 important
+        bean.important = true;
+    
+    2b. 通知判定
+        if (Monitor.isImportantForNotification(...)) {
+            2c. 发送通知
+                await Monitor.sendNotification(isFirstBeat, this, bean);
+        }
+    
+    2d. 重置 downCount
+        bean.downCount = 0;
+    
+    2e. 清除缓存
+        apicache.clear();
+
+  分支 B: isImportant = false
+    2f. 检查持续 DOWN 重发通知
+        if (bean.status === DOWN && this.resendInterval > 0) {
+            ++bean.downCount;
+            if (bean.downCount >= this.resendInterval) {
+                // 重发通知
+                await Monitor.sendNotification(isFirstBeat, this, bean);
+                bean.downCount = 0;
+            }
+        }
+```
+
+#### 4.3.2 持续 DOWN 重发通知
 
 ```javascript
 // server/model/monitor.js:1024-1037
@@ -363,32 +522,85 @@ if (bean.status === DOWN && this.resendInterval > 0) {
     ++bean.downCount;
     if (bean.downCount >= this.resendInterval) {
         // 仍然 DOWN，再次发送通知
-        log.debug(
-            "monitor",
-            `[${this.name}] sendNotification again: Down Count: ${bean.downCount} | Resend Interval: ${this.resendInterval}`
-        );
         await Monitor.sendNotification(isFirstBeat, this, bean);
-
+        
         // 重置 downCount
         bean.downCount = 0;
     }
 }
 ```
 
-**规则**：
+**重发规则**：
 - `resendInterval > 0` 时启用重发
 - 每 `resendInterval` 次心跳后重发一次通知
 - 重发后重置 `downCount`
 
+#### 4.3.3 `sendNotification` 方法详情
+
+```javascript
+// server/model/monitor.js:1486-1553
+static async sendNotification(isFirstBeat, monitor, bean) {
+    // 首次心跳且状态不是 DOWN 时不发送
+    if (!isFirstBeat || bean.status === DOWN) {
+        // 获取通知配置列表
+        const notificationList = await Monitor.getNotificationList(monitor);
+
+        // 构建消息文本
+        let text = bean.status === UP ? "✅ Up" : "🔴 Down";
+        let msg = `[${monitor.name}] [${text}] ${bean.msg}`;
+
+        // 准备通知数据
+        const heartbeatJSON = await bean.toJSONAsync({ decodeResponse: true });
+
+        // 服务恢复时计算停机时间
+        if (bean.status === UP && monitor.id) {
+            try {
+                // 查询最近一次重要的 DOWN 心跳（状态转换点）
+                const lastDownHeartbeat = await R.getRow(
+                    "SELECT time FROM heartbeat WHERE monitor_id = ? AND status = ? AND important = 1 ORDER BY time DESC LIMIT 1",
+                    [monitor.id, DOWN]
+                );
+                if (lastDownHeartbeat && lastDownHeartbeat.time) {
+                    heartbeatJSON["lastDownTime"] = lastDownHeartbeat.time;
+                }
+            } catch (error) {
+                // 静默失败
+            }
+        }
+
+        // 遍历所有通知方式发送
+        for (let notification of notificationList) {
+            try {
+                await Notification.send(
+                    JSON.parse(notification.config),
+                    msg,
+                    monitor.toJSON(preloadData, false),
+                    heartbeatJSON
+                );
+            } catch (e) {
+                log.error("monitor", "Cannot send notification to " + notification.name);
+            }
+        }
+    }
+}
+```
+
+**通知内容**：
+- 状态图标：`✅ Up` 或 `🔴 Down`
+- 监控名称
+- 详细消息（来自 `bean.msg`）
+- 心跳时间（服务器时区和本地时间）
+- 服务恢复时：上次故障时间（`lastDownTime`）
+
 ---
 
-## 4. Uptime 计算与统计
+## 5. Uptime 计算与统计写入
 
-### 4.1 UptimeCalculator 类
+### 5.1 UptimeCalculator 类
 
 Uptime 计算由 `server/uptime-calculator.js` 中的 `UptimeCalculator` 类负责。
 
-#### 4.1.1 数据存储结构
+#### 5.1.1 数据存储结构
 
 | 统计类型 | 时间粒度 | 保留时间 | 表名 |
 |---------|---------|---------|------|
@@ -396,7 +608,7 @@ Uptime 计算由 `server/uptime-calculator.js` 中的 `UptimeCalculator` 类负�
 | 小时级 | 1 小时 | 30 天 | `stat_hourly` |
 | 天级 | 1 天 | 365 天 | `stat_daily` |
 
-#### 4.1.2 状态扁平化
+#### 5.1.2 状态扁平化
 
 在计算 Uptime 时，状态会被扁平化：
 
@@ -415,48 +627,144 @@ flatStatus(status) {
 }
 ```
 
-### 4.2 心跳更新流程
+### 5.2 统计写入流程
 
-每次心跳后调用 `UptimeCalculator.update()`：
+#### 5.2.1 统计写入时序
+
+**阶段 1：获取 UptimeCalculator 实例**
 
 ```javascript
-// server/model/monitor.js:1088-1090
 let uptimeCalculator = await UptimeCalculator.getUptimeCalculator(this.id);
-let endTimeDayjs = await uptimeCalculator.update(bean.status, parseFloat(bean.ping));
-bean.end_time = R.isoDateTimeMillis(endTimeDayjs);
-```
 
-#### 4.2.1 更新逻辑
-
-```javascript
-// server/uptime-calculator.js:212-282
-async update(status, ping = 0, date) {
-    let flatStatus = this.flatStatus(status);
-
-    let divisionKey = this.getMinutelyKey(date);  // 分钟级 key
-    let hourlyKey = this.getHourlyKey(date);        // 小时级 key
-    let dailyKey = this.getDailyKey(date);          // 天级 key
-
-    if (status === MAINTENANCE) {
-        // 维护状态单独计数
-        minutelyData.maintenance = minutelyData.maintenance ? minutelyData.maintenance + 1 : 1;
-        hourlyData.maintenance = hourlyData.maintenance ? hourlyData.maintenance + 1 : 1;
-        dailyData.maintenance = dailyData.maintenance ? dailyData.maintenance + 1 : 1;
-    } else if (flatStatus === UP) {
-        // UP 状态：增加 up 计数，更新 ping 统计
-        minutelyData.up += 1;
-        // ... 更新 avgPing, minPing, maxPing 计算
-    } else if (flatStatus === DOWN) {
-        // DOWN 状态：增加 down 计数
-        minutelyData.down += 1;
-    }
-
-    // 存储到数据库
-    // ...
+// getUptimeCalculator 内部逻辑:
+if (!UptimeCalculator.list[monitorID]) {
+    UptimeCalculator.list[monitorID] = new UptimeCalculator();
+    await UptimeCalculator.list[monitorID].init(monitorID);
+    // init(): 从数据库加载历史统计数据
 }
 ```
 
-### 4.3 Uptime 计算公式
+**阶段 2：更新统计数据**
+
+```javascript
+let endTimeDayjs = await uptimeCalculator.update(bean.status, parseFloat(bean.ping));
+
+// update() 内部详细流程:
+
+// 2.1 状态扁平化
+let flatStatus = this.flatStatus(status);
+
+// 2.2 计算时间槽 key
+let divisionKey = this.getMinutelyKey(date);  // 分钟级
+let hourlyKey = this.getHourlyKey(date);        // 小时级
+let dailyKey = this.getDailyKey(date);          // 天级
+
+// 2.3 根据状态更新计数
+
+// 维护模式：单独计数
+if (status === MAINTENANCE) {
+    minutelyData.maintenance = minutelyData.maintenance ? minutelyData.maintenance + 1 : 1;
+    // ... 同样更新 hourly 和 daily
+}
+
+// UP 状态：增加 up 计数，更新 ping 统计
+else if (flatStatus === UP) {
+    minutelyData.up += 1;
+    
+    // 更新 ping 统计（仅 UP 状态有效）
+    if (!isNaN(ping)) {
+        if (minutelyData.up === 1) {
+            // 该分钟第一次：直接赋值
+            minutelyData.avgPing = ping;
+            minutelyData.minPing = ping;
+            minutelyData.maxPing = ping;
+        } else {
+            // 该分钟后续：计算平均值
+            minutelyData.avgPing = (minutelyData.avgPing * (minutelyData.up - 1) + ping) / minutelyData.up;
+            minutelyData.minPing = Math.min(minutelyData.minPing, ping);
+            minutelyData.maxPing = Math.max(minutelyData.maxPing, ping);
+        }
+    }
+    // ... 同样更新 hourly 和 daily
+}
+
+// DOWN 状态：增加 down 计数
+else if (flatStatus === DOWN) {
+    minutelyData.down += 1;
+    // ... 同样更新 hourly 和 daily
+}
+
+// 2.4 存储到数据库
+
+// 天级统计（总是存储）
+let dailyStatBean = await this.getDailyStatBean(dailyKey);
+dailyStatBean.up = dailyData.up;
+dailyStatBean.down = dailyData.down;
+dailyStatBean.ping = dailyData.avgPing;
+dailyStatBean.pingMin = dailyData.minPing;
+dailyStatBean.pingMax = dailyData.maxPing;
+await R.store(dailyStatBean);
+
+// 小时级统计（最近 30 天）
+if (date.isAfter(currentDate.subtract(this.statHourlyKeepDay, "day"))) {
+    let hourlyStatBean = await this.getHourlyStatBean(hourlyKey);
+    // ... 更新字段
+    await R.store(hourlyStatBean);
+}
+
+// 分钟级统计（最近 24 小时）
+if (date.isAfter(currentDate.subtract(this.statMinutelyKeepHour, "hour"))) {
+    let minutelyStatBean = await this.getMinutelyStatBean(divisionKey);
+    // ... 更新字段
+    await R.store(minutelyStatBean);
+}
+
+// 2.5 清理过期数据
+if (!this.migrationMode) {
+    // 删除超过 24 小时的分钟级统计
+    await R.exec("DELETE FROM stat_minutely WHERE monitor_id = ? AND timestamp < ?", [...]);
+    
+    // 删除超过 30 天的小时级统计
+    await R.exec("DELETE FROM stat_hourly WHERE monitor_id = ? AND timestamp < ?", [...]);
+}
+```
+
+**阶段 3：心跳记录存储**
+
+```javascript
+bean.end_time = R.isoDateTimeMillis(endTimeDayjs);
+await R.store(bean);  // 存储 heartbeat 记录
+```
+
+**阶段 4：前端推送**
+
+```javascript
+// 发送心跳事件到前端
+io.to(this.user_id).emit("heartbeat", bean.toJSON());
+
+// 发送统计数据（24h、30d、1y uptime 和 avgPing）
+Monitor.sendStats(io, this.id, this.user_id);
+
+// sendStats 内部:
+let data24h = await uptimeCalculator.get24Hour();
+io.to(userID).emit("avgPing", monitorID, data24h.avgPing);
+io.to(userID).emit("uptime", monitorID, 24, data24h.uptime);
+// ... 同样发送 30d 和 1y 的数据
+```
+
+**阶段 5：Prometheus 指标更新（如果启用）**
+
+```javascript
+const data24h = uptimeCalculator.get24Hour();
+const data30d = uptimeCalculator.get30Day();
+const data1y = uptimeCalculator.get1Year();
+
+this.prometheus?.update(bean, tlsInfo, {
+    data24h, data30d, data1y
+});
+```
+
+### 5.3 Uptime 计算公式
 
 ```javascript
 // server/uptime-calculator.js:681-685
@@ -473,7 +781,7 @@ if (total.up + total.down === 0) {
 - MAINTENANCE 状态在扁平化时视为 UP，但在存储时单独记录 `maintenance` 计数
 - PENDING 状态视为 DOWN
 
-### 4.4 常用统计方法
+### 5.4 常用统计方法
 
 | 方法 | 说明 | 时间范围 |
 |------|------|---------|
@@ -484,12 +792,214 @@ if (total.up + total.down === 0) {
 
 ---
 
-## 附录：关键代码位置速查表
+## 6. 完整时序图
+
+### 6.1 单次心跳完整时序
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                           单次心跳完整时序图                                              │
+├─────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                          │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐       │
+│  │ 调度器    │    │ 参数解析  │    │ 状态判定  │    │ 通知处理  │    │ 统计存储  │       │
+│  └────┬─────┘    └────┬─────┘    └────┬─────┘    └────┬─────┘    └────┬─────┘       │
+│       │                │                │                │                │              │
+│       │  1. 启动 beat()│                │                │                │              │
+│       │───────────────>│                │                │                │              │
+│       │                │                │                │                │              │
+│       │                │  2. 初始化状态 │                │                │              │
+│       │                │  bean.status=  │                │                │              │
+│       │                │  DOWN (+翻转)  │                │                │              │
+│       │                │                │                │                │              │
+│       │                │  3. 维护检测  │                │                │              │
+│       │                │  isUnder-     │                │                │              │
+│       │                │  Maintenance? │                │                │              │
+│       │                │       │        │                │                │              │
+│       │                │      是│否     │                │                │              │
+│       │                │       └───────>│                │                │              │
+│       │                │                │                │                │              │
+│       │                │                │  4. 执行检查  │                │              │
+│       │                │                │  (HTTP/Ping/  │                │              │
+│       │                │                │   插件等)     │                │              │
+│       │                │                │       │        │                │              │
+│       │                │                │     成│功     │                │              │
+│       │                │                │       └───────>│                │              │
+│       │                │                │                │                │              │
+│       │                │                │  5. 检查后翻转 │                │              │
+│       │                │                │  (Upside Down) │                │              │
+│       │                │                │  bean.status = │                │              │
+│       │                │                │  flipStatus(..)│                │              │
+│       │                │                │       │        │                │              │
+│       │                │                │   翻转后│ DOWN？│                │              │
+│       │                │                │       └────────>│                │              │
+│       │                │                │                │                │              │
+│       │                │                │  6. 重试判定  │                │              │
+│       │                │                │  maxretries>0  │                │              │
+│       │                │                │  && retries <  │                │              │
+│       │                │                │  maxretries?   │                │              │
+│       │                │                │       │        │                │              │
+│       │                │                │      是│否     │                │              │
+│       │                │                │       │        │                │              │
+│       │                │                │  PENDING│DOWN  │                │              │
+│       │                │                │       │        │                │              │
+│       │                │                │       └───────>│                │              │
+│       │                │                │                │                │              │
+│       │                │                │                │  7. 重要心跳   │              │
+│       │                │                │                │  isImportant?  │              │
+│       │                │                │                │       │        │              │
+│       │                │                │                │      是│否     │              │
+│       │                │                │                │       │        │              │
+│       │                │                │                │  发送 │检查   │              │
+│       │                │                │                │  通知 │持续   │              │
+│       │                │                │                │       │DOWN?  │              │
+│       │                │                │                │       │        │              │
+│       │                │                │                │       └───────>│              │
+│       │                │                │                │                │              │
+│       │                │                │                │                │  8. 更新统计 │
+│       │                │                │                │                │  UptimeCalc │
+│       │                │                │                │                │  .update()   │
+│       │                │                │                │                │              │
+│       │                │                │                │                │  9. 存储心跳 │
+│       │                │                │                │                │  R.store()   │
+│       │                │                │                │                │              │
+│       │                │                │                │                │  10. 推送前端│
+│       │                │                │                │                │  Socket.io   │
+│       │                │                │                │                │              │
+│       │                │                │                │                │  11. 更新    │
+│       │                │                │                │                │  Prometheus  │
+│       │                │                │                │                │              │
+│       │ <────────────────────────────────────────────────────────────────│              │
+│       │  12. 调度下一次检查                                              │              │
+│       │  setTimeout(safeBeat, intervalRemainingMs)                      │              │
+│       │                                                                   │              │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 状态转换完整链路
+
+#### 6.2.1 正常模式（UP → DOWN → UP）
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    正常模式状态转换链路                                       │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  初始状态: UP                                                                │
+│       │                                                                     │
+│       ▼                                                                     │
+│  ┌─────────────────┐                                                        │
+│  │ 检查失败        │                                                        │
+│  │ maxretries = 3 │                                                        │
+│  └────────┬────────┘                                                        │
+│           │                                                                 │
+│           ▼                                                                 │
+│  ┌─────────────────┐    重要？ ❌ 否                                       │
+│  │ 状态: PENDING   │────────────────────────────> 不触发通知              │
+│  │ retries: 1      │                                                        │
+│  └────────┬────────┘                                                        │
+│           │                                                                 │
+│           ▼                                                                 │
+│  ┌─────────────────┐    重要？ ❌ 否                                       │
+│  │ 状态: PENDING   │────────────────────────────> 不触发通知              │
+│  │ retries: 2      │                                                        │
+│  └────────┬────────┘                                                        │
+│           │                                                                 │
+│           ▼                                                                 │
+│  ┌─────────────────┐    重要？ ❌ 否                                       │
+│  │ 状态: PENDING   │────────────────────────────> 不触发通知              │
+│  │ retries: 3      │                                                        │
+│  └────────┬────────┘                                                        │
+│           │                                                                 │
+│           ▼                                                                 │
+│  ┌─────────────────┐    重要？ ✅ 是（PENDING→DOWN）                      │
+│  │ 状态: DOWN      │────────────────────────────> 触发通知                │
+│  │ retries: 4      │   通知？ ✅ 是                                       │
+│  └────────┬────────┘                                                        │
+│           │                                                                 │
+│           ▼                                                                 │
+│  ┌─────────────────┐    重要？ ❌ 否                                       │
+│  │ 状态: DOWN      │────────────────────────────> 检查持续 DOWN 重发     │
+│  │ retries: 5      │   resendInterval > 0 ?                               │
+│  └────────┬────────┘                                                        │
+│           │                                                                 │
+│           ▼                                                                 │
+│  ┌─────────────────┐    重要？ ✅ 是（DOWN→UP）                           │
+│  │ 状态: UP        │────────────────────────────> 触发通知                │
+│  │ retries: 0      │   通知？ ✅ 是                                       │
+│  │ (检查成功重置)   │                                                        │
+│  └─────────────────┘                                                        │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 6.2.2 Upside Down 模式
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    Upside Down 模式状态转换链路                              │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  核心逻辑: 成功 → 翻转成 DOWN → 视为"故障"                                   │
+│           失败 → 翻转成 UP → 视为"正常"                                     │
+│                                                                              │
+│  初始状态: UP (原始检查失败后翻转)                                            │
+│       │                                                                     │
+│       ▼                                                                     │
+│  ┌─────────────────────────────────────┐                                    │
+│  │ 原始检查: 成功 (UP)                  │                                    │
+│  │ 检查后翻转: 翻转成 DOWN              │                                    │
+│  │ 抛出错误: "Flip UP to DOWN"          │                                    │
+│  └─────────────────┬───────────────────┘                                    │
+│                    │                                                         │
+│                    ▼                                                         │
+│  ┌─────────────────────────────────────┐                                    │
+│  │ catch 块处理                         │                                    │
+│  │ 此时 bean.status = DOWN (翻转后)     │                                    │
+│  │ 注意: isUpsideDown() && bean.status  │                                    │
+│  │       === UP 条件不成立 (当前是 DOWN) │                                    │
+│  │       → 进入通用重试逻辑             │                                    │
+│  └─────────────────┬───────────────────┘                                    │
+│                    │                                                         │
+│                    ▼                                                         │
+│  ┌─────────────────────────────────────┐                                    │
+│  │ 状态: PENDING (如果 maxretries > 0) │                                    │
+│  │ 或: DOWN (如果 maxretries = 0)      │                                    │
+│  └─────────────────┬───────────────────┘                                    │
+│                    │                                                         │
+│                    ▼                                                         │
+│  ┌─────────────────────────────────────┐                                    │
+│  │ 原始检查: 失败 (DOWN)                │                                    │
+│  │ 检查后翻转: 翻转成 UP                │                                    │
+│  │ 不抛出错误 (bean.status !== DOWN)    │                                    │
+│  └─────────────────┬───────────────────┘                                    │
+│                    │                                                         │
+│                    ▼                                                         │
+│  ┌─────────────────────────────────────┐                                    │
+│  │ catch 块处理                         │                                    │
+│  │ 此时 bean.status = UP (翻转后)       │                                    │
+│  │ 条件: isUpsideDown() && bean.status  │                                    │
+│  │       === UP → 成立                  │                                    │
+│  │ 操作: retries = 0 (重置)             │                                    │
+│  │ 状态: 保持 UP (视为"正常")           │                                    │
+│  └─────────────────────────────────────┘                                    │
+│                                                                              │
+│  总结:                                                                       │
+│  - 原始检查成功 → 翻转后 DOWN → 视为故障 → 触发重试/通知                   │
+│  - 原始检查失败 → 翻转后 UP → 视为正常 → 不触发重试/通知                   │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 7. 附录：关键代码位置速查表
 
 | 功能模块 | 文件路径 | 关键行号 |
 |---------|---------|----------|
 | 监控启动 | `server/model/monitor.js` | 409-1149 |
 | 心跳执行 | `server/model/monitor.js` | 421-1120 |
+| 状态码校验 | `server/util-server.js` | 552-585 |
 | 重要心跳判定 | `server/model/monitor.js` | 1419-1445 |
 | 通知触发判定 | `server/model/monitor.js` | 1454-1477 |
 | 发送通知 | `server/model/monitor.js` | 1486-1553 |
@@ -497,3 +1007,5 @@ if (total.up + total.down === 0) {
 | 状态常量 | `src/util.js` | 21-24 |
 | Uptime 计算 | `server/uptime-calculator.js` | 全文 |
 | 后台任务 | `server/jobs.js` | 全文 |
+| 监控类型基类 | `server/monitor-types/monitor-type.js` | 全文 |
+| TCP 监控类型 | `server/monitor-types/tcp.js` | 全文 |
