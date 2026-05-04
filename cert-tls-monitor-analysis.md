@@ -8,7 +8,11 @@
 4. [域名过期监控](#4-域名过期监控)
 5. [告警通知机制](#5-告警通知机制)
 6. [前端展示](#6-前端展示)
-7. [关键代码位置汇总](#7-关键代码位置汇总)
+7. [告警状态边界关系分析](#7-告警状态边界关系分析)
+8. [端到端时序说明](#8-端到端时序说明)
+9. [关键代码位置汇总](#9-关键代码位置汇总)
+10. [关键技术点](#10-关键技术点)
+11. [配置与扩展](#11-配置与扩展)
 
 ---
 
@@ -21,6 +25,8 @@ Uptime Kuma 对 HTTPS 证书、域名过期和 TLS 元数据的监控是一个�
 - **保存**：将解析后的信息存储到数据库
 - **告警**：根据剩余天数触发通知
 - **展示**：在前端页面实时显示剩余天数和告警状态
+
+> **重要区分**：通知发送、页面展示、徽章展示是三套**独立的机制**，使用不同的阈值和判断逻辑。详见 [第7章](#7-告警状态边界关系分析)。
 
 ---
 
@@ -588,7 +594,17 @@ get daysRemaining() {
 
 ### 4.3 支持的监控类型
 
-**位置**：`src/util.js` 中定义的 `TYPES_WITH_DOMAIN_EXPIRY_SUPPORT_VIA_FIELD`
+**位置**：`src/util.ts:776-781` 中定义的 `TYPES_WITH_DOMAIN_EXPIRY_SUPPORT_VIA_FIELD`
+
+```javascript
+export const TYPES_WITH_DOMAIN_EXPIRY_SUPPORT_VIA_FIELD = {
+    http: "url",
+    keyword: "url",
+    "json-query": "url",
+    "real-browser": "url",
+    "websocket-upgrade": "url",
+};
+```
 
 只有特定类型的监控支持域名过期检查，需要从监控配置中提取域名。
 
@@ -623,6 +639,8 @@ if (bean.status !== MAINTENANCE && Boolean(this.domainExpiryNotification)) {
     }
 }
 ```
+
+> **重要**：`domainExpiryNotification` 只影响**是否发送通知**和**是否执行 RDAP 查询**，不影响数据推送到前端（见 [第7章](#7-告警状态边界关系分析)）。
 
 ---
 
@@ -660,6 +678,8 @@ async function checkCertExpiryNotifications(monitor, tlsInfoObject) {
     }
 
     // 遍历每个告警天数
+    // 注意：证书过期检查没有对 notifyDays 进行排序！
+    // 对比：域名过期检查明确进行了升序排序
     for (const targetDays of notifyDays) {
         let certInfo = tlsInfoObject.certInfo;
         
@@ -737,13 +757,56 @@ module.exports.rootCertificatesFingerprints = () => {
 
 #### 5.1.3 发送证书过期通知
 
-**位置**：`server/model/monitor.js` 中的 `sendCertNotificationByTargetDays` 方法
+**位置**：`server/model/monitor.js:1578-1614`
 
-该方法会：
-1. 检查 `notification_sent_history` 表，避免重复发送
-2. 构造通知消息
-3. 通过配置的通知渠道发送（Email、Slack、Telegram 等）
-4. 记录发送历史
+```javascript
+async sendCertNotificationByTargetDays(certCN, certType, daysRemaining, targetDays, notificationList) {
+    // 关键：查询条件是 days <= targetDays，不是 days = targetDays
+    // 这意味着：如果已经发送过 7 天的通知（days=7），
+    // 当检查 14 天的阈值时，7 <= 14 成立，所以不会发送 14 天的通知
+    let row = await R.getRow(
+        "SELECT * FROM notification_sent_history WHERE type = ? AND monitor_id = ? AND days <= ?",
+        ["certificate", this.id, targetDays]
+    );
+
+    // Sent already, no need to send again
+    if (row) {
+        log.debug("monitor", "Sent already, no need to send again");
+        return;
+    }
+
+    let sent = false;
+    log.debug("monitor", "Send certificate notification");
+
+    for (let notification of notificationList) {
+        try {
+            log.debug("monitor", "Sending to " + notification.name);
+            await Notification.send(
+                JSON.parse(notification.config),
+                `[${this.name}][${this.url}] ${certType} certificate ${certCN} will expire in ${daysRemaining} days`
+            );
+            sent = true;
+        } catch (e) {
+            log.error("monitor", "Cannot send cert notification to " + notification.name);
+            log.error("monitor", e);
+        }
+    }
+
+    if (sent) {
+        // 记录发送的是 targetDays，不是 daysRemaining
+        await R.exec("INSERT INTO notification_sent_history (type, monitor_id, days) VALUES(?, ?, ?)", [
+            "certificate",
+            this.id,
+            targetDays,
+        ]);
+    }
+}
+```
+
+> **关键点**：
+> 1. 查询条件是 `days <= targetDays`，这是一个**累积防重**逻辑
+> 2. 记录的是 `targetDays`（目标天数），不是 `daysRemaining`（实际剩余天数）
+> 3. 证书过期检查**没有对 `notifyDays` 进行排序**（对比域名过期有排序）
 
 ### 5.2 域名过期告警
 
@@ -781,6 +844,7 @@ static async sendNotifications(domainName, notificationList) {
 
     if (Array.isArray(notifyDays)) {
         // 升序排列，确保只发送最紧急的一次通知
+        // 注释说明：Asc sort to avoid sending multiple notifications if daysRemaining is below multiple targetDays
         notifyDays.sort((a, b) => a - b);
         
         for (const targetDays of notifyDays) {
@@ -791,6 +855,8 @@ static async sendNotifications(domainName, notificationList) {
                 continue;
             } 
             // 已经发送过该天数的通知，跳过
+            // 关键：条件是 lastSent <= targetDays
+            // 这意味着：如果已经发送过 7 天的通知，14 天和 21 天的都不会发送
             else if (lastSent && lastSent <= targetDays) {
                 log.debug("domain_expiry", 
                     `Notification for ${domainName} on ${targetDays} deadline sent already, no need to send again.`);
@@ -809,7 +875,7 @@ static async sendNotifications(domainName, notificationList) {
             if (sent) {
                 domain.lastExpiryNotificationSent = targetDays;
                 await R.store(domain);
-                return targetDays;  // 只发送一次最紧急的
+                return targetDays;  // 只发送一次最紧急的，直接返回
             }
         }
     }
@@ -857,6 +923,23 @@ await knex.schema.createTable("notification_sent_history", (table) => {
 });
 ```
 
+### 5.4 证书 vs 域名：通知防重逻辑对比
+
+| 特性 | 证书过期 | 域名过期 |
+|------|----------|----------|
+| **存储位置** | `notification_sent_history` 表 | `domain_expiry.lastExpiryNotificationSent` 字段 |
+| **查询条件** | `days <= targetDays` | `lastSent <= targetDays` |
+| **排序** | ❌ 没有排序 | ✅ 升序排序 |
+| **发送后返回** | 继续遍历 | 立即 `return` |
+| **记录值** | `targetDays` | `targetDays` |
+
+> **潜在问题**：证书过期检查没有对 `notifyDays` 进行排序。如果用户自定义顺序为 `[21, 14, 7]`，当剩余天数为 5 天时：
+> 1. 检查 21 天：`5 <= 21`，发送，记录 `days=21`
+> 2. 检查 14 天：查询 `days <= 14`，`21 <= 14` 不成立，发送，记录 `days=14`
+> 3. 检查 7 天：查询 `days <= 7`，`14 <= 7` 不成立，发送，记录 `days=7`
+> 
+> 这样会发送 3 次通知！而域名过期由于有排序和 `return`，只会发送 1 次。
+
 ---
 
 ## 6. 前端展示
@@ -893,6 +976,7 @@ static async sendCertInfo(io, monitorID, userID) {
 static async sendDomainInfo(io, monitorID, userID) {
     const monitor = await R.findOne("monitor", "id = ?", [monitorID]);
     try {
+        // 注意：这里只检查监控类型是否支持，不检查 domainExpiryNotification
         const supportInfo = await DomainExpiry.checkSupport(monitor);
         const domain = await DomainExpiry.findByDomainNameOrCreate(supportInfo.domain);
         if (domain?.expiry) {
@@ -902,11 +986,16 @@ static async sendDomainInfo(io, monitorID, userID) {
 }
 ```
 
+> **关键发现**：`sendDomainInfo` **不检查** `domainExpiryNotification`，只检查监控类型是否支持。只要数据库中有过期日期，就会推送到前端。
+
 #### 6.1.2 前端接收
 
-**位置**：`src/mixins/socket.js:252-258`
+**位置**：`src/mixins/socket.js:52,252-258`
 
 ```javascript
+// 初始化
+domainInfoList: {},
+
 // 接收证书信息
 socket.on("certInfo", (monitorID, data) => {
     this.tlsInfoList[monitorID] = JSON.parse(data);
@@ -1035,6 +1124,7 @@ export default {
 </div>
 
 <!-- 域名过期信息摘要 -->
+<!-- 注意：只检查 domainInfo 是否存在，不检查 domainExpiryNotification -->
 <div v-if="domainInfo" class="col-12 col-sm col row d-flex align-items-center d-sm-block">
     <h4 class="col-4 col-sm-12">{{ $t("labelDomainExpiry") }}</h4>
     <p class="col-4 col-sm-12 mb-0 mb-sm-2">
@@ -1064,6 +1154,7 @@ export default {
 ```javascript
 // 证书信息
 tlsInfo() {
+    // 检查 tlsInfoList 中是否有数据，且有 certInfo 字段
     if (this.$root.tlsInfoList[this.monitor.id] && this.$root.tlsInfoList[this.monitor.id].certInfo) {
         return this.$root.tlsInfoList[this.monitor.id];
     }
@@ -1071,12 +1162,9 @@ tlsInfo() {
 },
 
 // 域名信息
+// 修正：实际代码不检查 domainExpiryNotification，只检查是否有数据
 domainInfo() {
-    if (this.monitor.domainExpiryNotification && 
-        this.$root.domainInfoList[this.monitor.id]) {
-        return this.$root.domainInfoList[this.monitor.id];
-    }
-    return null;
+    return this.$root.domainInfoList[this.monitor.id] || null;
 },
 
 // 是否显示证书详情框
@@ -1085,53 +1173,527 @@ showCertInfoBox() {
 },
 ```
 
+> **关键修正**：
+> - 原文档描述有误，`domainInfo()` 计算属性**不检查** `monitor.domainExpiryNotification`
+> - 只检查 `domainInfoList` 中是否有数据
+> - 数据推送和展示与 `domainExpiryNotification` 无关
+
 ### 6.5 Badge API（公开徽章）
 
-**位置**：`server/routers/api-router.js:461-494`
+**位置**：`server/routers/api-router.js:424-505`
 
 系统还提供了公开的 Badge API，用于在外部网站显示证书状态：
 
 ```javascript
-router.get("/api/badge/:id/cert", cache("5 minutes"), async (request, response) => {
-    // ...
-    const tlsInfoBean = await R.findOne("monitor_tls_info", "monitor_id = ?", [requestedMonitorId]);
+router.get("/api/badge/:id/cert-exp", cache("5 minutes"), async (request, response) => {
+    allowAllOrigin(response);
 
-    if (!tlsInfoBean) {
-        badgeValues.message = "No/Bad Cert";
-        badgeValues.color = badgeConstants.naColor;
-    } else {
-        const tlsInfo = JSON.parse(tlsInfoBean.info_json);
+    // 徽章颜色阈值（可通过 URL 参数自定义）
+    const {
+        upColor = badgeConstants.defaultUpColor,        // 绿色 #66c20a
+        warnColor = badgeConstants.defaultWarnColor,      // 黄色 #eed202
+        downColor = badgeConstants.defaultDownColor,      // 红色 #c2290a
+        warnDays = badgeConstants.defaultCertExpireWarnDays,  // 默认 14 天
+        downDays = badgeConstants.defaultCertExpireDownDays,  // 默认 7 天
+        // ...
+    } = request.query;
 
-        if (!tlsInfo.valid) {
-            badgeValues.message = "Bad Cert";
-            badgeValues.color = downColor;
+    try {
+        const requestedMonitorId = parseInt(request.params.id, 10);
+        const publicMonitor = await isMonitorPublic(requestedMonitorId);
+
+        if (!publicMonitor) {
+            // 监控不是公开的，显示 N/A
+            badgeValues.message = "N/A";
+            badgeValues.color = badgeConstants.naColor;
         } else {
-            const daysRemaining = tlsInfo.certInfo.daysRemaining;
-            
-            // 根据剩余天数设置颜色
-            if (daysRemaining > warnDays) {
-                badgeValues.color = upColor;      // 绿色
-            } else if (daysRemaining > downDays) {
-                badgeValues.color = warnColor;    // 黄色
+            const tlsInfoBean = await R.findOne("monitor_tls_info", "monitor_id = ?", [requestedMonitorId]);
+
+            if (!tlsInfoBean) {
+                // 没有保存的证书信息
+                badgeValues.message = "No/Bad Cert";
+                badgeValues.color = badgeConstants.naColor;
             } else {
-                badgeValues.color = downColor;    // 红色
+                const tlsInfo = JSON.parse(tlsInfoBean.info_json);
+
+                if (!tlsInfo.valid) {
+                    // 证书无效
+                    badgeValues.message = "Bad Cert";
+                    badgeValues.color = downColor;
+                } else {
+                    const daysRemaining = parseInt(overrideValue ?? tlsInfo.certInfo.daysRemaining);
+
+                    // 关键：徽章使用区间判断
+                    if (daysRemaining > warnDays) {
+                        badgeValues.color = upColor;      // 绿色：>14天
+                    } else if (daysRemaining > downDays) {
+                        badgeValues.color = warnColor;    // 黄色：7-14天
+                    } else {
+                        badgeValues.color = downColor;    // 红色：<=7天
+                    }
+                    
+                    badgeValues.message = `${daysRemaining} days`;
+                }
             }
-            
-            badgeValues.message = `${daysRemaining} days`;
         }
+
+        const svg = makeBadge(badgeValues);
+        response.type("image/svg+xml");
+        response.send(svg);
+    } catch (error) {
+        sendHttpError(response, error.message);
     }
-    // 生成 SVG 徽章
-    const svg = makeBadge(badgeValues);
-    response.type("image/svg+xml");
-    response.send(svg);
 });
 ```
 
 ---
 
-## 7. 关键代码位置汇总
+## 7. 告警状态边界关系分析
 
-### 7.1 后端代码
+### 7.1 三套独立机制
+
+**重要发现**：通知发送、页面展示、徽章展示是三套**完全独立**的机制，使用不同的阈值和判断逻辑。
+
+| 机制 | 配置项 | 默认值 | 判断逻辑 | 用途 |
+|------|--------|--------|----------|------|
+| **通知发送** | `tlsExpiryNotifyDays` | `[7, 14, 21]` | `daysRemaining <= targetDays` | 触发邮件/Slack/Telegram 等通知 |
+| **通知发送** | `domainExpiryNotifyDays` | `[7, 14, 21]` | `daysRemaining <= targetDays` | 触发邮件/Slack/Telegram 等通知 |
+| **徽章警告** | `defaultCertExpireWarnDays` | `14` | `daysRemaining > 7 && daysRemaining <= 14` | 显示黄色徽章 |
+| **徽章危险** | `defaultCertExpireDownDays` | `7` | `daysRemaining <= 7` | 显示红色徽章 |
+| **页面展示** | 无专用配置 | 无 | `v-if="tlsInfo"` / `v-if="domainInfo"` | 只要有数据就显示 |
+
+### 7.2 判断逻辑对比
+
+#### 7.2.1 通知发送逻辑
+
+```
+检查条件：daysRemaining <= targetDays
+
+默认 targetDays: [7, 14, 21]
+
+示例：daysRemaining = 5
+├── 检查 21 天：5 <= 21 ✅ 可发送
+├── 检查 14 天：5 <= 14 ✅ 可发送
+└── 检查 7 天：  5 <= 7  ✅ 可发送
+
+但由于防重机制（days <= targetDays），只会发送一次（最紧急的那个）
+```
+
+#### 7.2.2 徽章展示逻辑
+
+```
+检查条件：区间判断
+
+默认阈值：warnDays=14, downDays=7
+
+示例：daysRemaining = 5
+├── daysRemaining > 14?  5 > 14?  ❌
+├── daysRemaining > 7?   5 > 7?   ❌
+└── 否则显示红色（downColor）
+
+示例：daysRemaining = 10
+├── daysRemaining > 14?  10 > 14? ❌
+├── daysRemaining > 7?   10 > 7?  ✅ 显示黄色（warnColor）
+└── ...
+
+示例：daysRemaining = 30
+├── daysRemaining > 14?  30 > 14? ✅ 显示绿色（upColor）
+└── ...
+```
+
+#### 7.2.3 页面展示逻辑
+
+```
+检查条件：是否有数据
+
+证书：v-if="tlsInfo"
+域名：v-if="domainInfo"
+
+只要 domainInfoList / tlsInfoList 中有数据，就显示
+不根据剩余天数改变显示样式（除了主机名不匹配的警告图标）
+```
+
+### 7.3 阈值对应关系（默认配置）
+
+| 剩余天数 | 通知发送 | 徽章颜色 | 页面展示 |
+|----------|----------|----------|----------|
+| > 21 天 | ❌ 不触发 | 🟢 绿色 | ✅ 显示 |
+| 15-21 天 | ✅ 21 天阈值 | 🟢 绿色 | ✅ 显示 |
+| 8-14 天 | ✅ 14 天阈值 | 🟡 黄色 | ✅ 显示 |
+| 1-7 天 | ✅ 7 天阈值 | 🔴 红色 | ✅ 显示 |
+| <= 0 天 | ✅ 所有阈值 | 🔴 红色 | ✅ 显示 |
+
+### 7.4 关键边界情况
+
+#### 7.4.1 数据推送 vs 通知发送
+
+**场景**：用户关闭了 `domainExpiryNotification`
+
+**影响**：
+| 功能 | 是否执行 |
+|------|----------|
+| RDAP 查询过期日期 | ❌ 不执行（心跳成功后的检查被跳过） |
+| 数据推送到前端 | ⚠️ 取决于数据库是否已有数据 |
+| 页面展示 | ⚠️ 取决于数据库是否已有数据 |
+| 发送通知 | ❌ 不发送 |
+
+**注意**：如果数据库中已有过期日期（比如之前启用过），`sendDomainInfo` 仍然会推送数据到前端。
+
+#### 7.4.2 证书更新后的行为
+
+**场景**：证书更新，`fingerprint256` 改变
+
+**行为**：
+1. `updateTlsInfo` 检测到指纹变化
+2. 清除 `notification_sent_history` 中该监控的证书通知记录
+3. 重新开始告警周期
+
+#### 7.4.3 域名续费后的行为
+
+**场景**：域名续费，`expiry` 日期延后
+
+**行为**：
+1. `checkExpiry` 检测到新日期 > 旧日期
+2. 清除 `lastExpiryNotificationSent`（设为 null）
+3. 重新开始告警周期
+
+### 7.5 防重机制深度解析
+
+#### 7.5.1 证书通知防重
+
+```
+数据库表：notification_sent_history
+查询条件：type = 'certificate' AND monitor_id = ? AND days <= ?
+
+场景：默认配置 [7, 14, 21]，按升序遍历
+
+第一次检查（daysRemaining = 5）：
+├── 检查 7 天：
+│   ├── 查询：days <= 7
+│   ├── 无记录，发送通知
+│   └── 插入记录：days = 7
+├── 检查 14 天：
+│   ├── 查询：days <= 14
+│   ├── 有记录（7 <= 14），跳过
+│   └── 不发送
+└── 检查 21 天：
+    ├── 查询：days <= 21
+    ├── 有记录（7 <= 21），跳过
+    └── 不发送
+
+结果：只发送 1 次通知（7 天阈值）
+```
+
+#### 7.5.2 域名通知防重
+
+```
+存储位置：domain_expiry.lastExpiryNotificationSent
+查询条件：lastSent <= targetDays
+
+场景：默认配置 [7, 14, 21]，升序排序后遍历
+
+第一次检查（daysRemaining = 5）：
+├── 检查 7 天：
+│   ├── lastSent 为 null，条件不成立
+│   ├── 发送通知
+│   └── 记录 lastSent = 7，立即 return
+├── 检查 14 天：（不会执行，因为已 return）
+└── 检查 21 天：（不会执行，因为已 return）
+
+结果：只发送 1 次通知（7 天阈值）
+```
+
+#### 7.5.3 潜在问题：证书过期检查没有排序
+
+```
+场景：用户自定义 notifyDays = [21, 14, 7]，daysRemaining = 5
+
+检查顺序：21 → 14 → 7
+
+├── 检查 21 天：
+│   ├── 查询：days <= 21
+│   ├── 无记录，发送通知
+│   └── 插入记录：days = 21
+├── 检查 14 天：
+│   ├── 查询：days <= 14
+│   ├── 21 <= 14? 不成立 ❌
+│   ├── 发送通知
+│   └── 插入记录：days = 14
+└── 检查 7 天：
+    ├── 查询：days <= 7
+    ├── 14 <= 7? 不成立 ❌
+    ├── 发送通知
+    └── 插入记录：days = 7
+
+结果：发送 3 次通知！（这是潜在问题）
+```
+
+> **对比**：域名过期检查明确进行了升序排序，并有注释说明原因。证书过期检查没有排序，可能导致多次通知。
+
+---
+
+## 8. 端到端时序说明
+
+### 8.1 证书监控完整时序
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           HTTPS 证书监控端到端时序                                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+时间轴 →
+│
+├── T1: 心跳检测开始
+│   │
+│   ├── HTTP 监控类型
+│   │   ├── 建立 HTTPS 连接
+│   │   ├── 监听 keylog / secureConnect 事件
+│   │   └── 触发 checkCertificate(socket)
+│   │
+│   ├── TCP/TLS 监控类型
+│   │   ├── tls.connect() 建立连接
+│   │   ├── secureConnect 事件触发
+│   │   └── 触发 checkCertificate(socket)
+│   │
+│   └── STARTTLS 类型
+│       ├── TCP 连接 → 发送 STARTTLS 命令
+│       ├── 升级到 TLS 连接
+│       └── 触发 checkCertificate(socket)
+│
+├── T2: 证书解析
+│   │
+│   ├── checkCertificate(socket)
+│   │   ├── socket.getPeerCertificate(true) 获取证书链
+│   │   └── 调用 parseCertificateInfo(info)
+│   │
+│   └── parseCertificateInfo(info)
+│       ├── 转换 valid_to → validTo (Date)
+│       ├── 计算 daysRemaining (UTC)
+│       ├── 识别 certType (server/intermediate/root)
+│       └── 提取 validFor (SAN 域名)
+│
+├── T3: 数据保存
+│   │
+│   └── handleTlsInfo(tlsInfo)
+│       ├── updateTlsInfo(tlsInfo)
+│       │   ├── 检查 fingerprint256 是否变化
+│       │   ├── 变化则清除 notification_sent_history
+│       │   └── JSON.stringify → monitor_tls_info 表
+│       │
+│       ├── prometheus.update() 更新指标
+│       │
+│       └── 条件检查：!getIgnoreTls() && isEnabledExpiryNotification()
+│           └── ✅ 满足 → 调用 checkCertExpiryNotifications()
+│
+├── T4: 告警检查（可选）
+│   │
+│   └── checkCertExpiryNotifications(monitor, tlsInfoObject)
+│       ├── 获取 notificationList
+│       ├── 获取 notifyDays（默认 [7, 14, 21]）
+│       │
+│       ├── 遍历每个 targetDays
+│       │   └── 遍历证书链
+│       │       ├── 跳过已知根证书
+│       │       ├── 检查 daysRemaining <= targetDays
+│       │       └── ✅ 满足 → 调用 sendCertNotificationByTargetDays()
+│       │
+│       └── sendCertNotificationByTargetDays()
+│           ├── 查询：days <= targetDays（防重）
+│           ├── ❌ 有记录 → 跳过
+│           └── ✅ 无记录 → 发送通知 + 插入 notification_sent_history
+│
+├── T5: 前端数据推送
+│   │
+│   └── sendStats(io, monitorID, userID) 触发
+│       │
+│       ├── sendCertInfo()
+│       │   ├── 查询 monitor_tls_info 表
+│       │   └── ✅ 有数据 → socket.emit("certInfo", monitorID, info_json)
+│       │
+│       └── sendDomainInfo()
+│           ├── 检查监控类型是否支持
+│           ├── 查询 domain_expiry 表
+│           └── ✅ 有数据 → socket.emit("domainInfo", monitorID, daysRemaining, expiresOn)
+│
+└── T6: 前端展示
+    │
+    ├── Socket 事件监听
+    │   ├── "certInfo" → tlsInfoList[monitorID] = JSON.parse(data)
+    │   └── "domainInfo" → domainInfoList[monitorID] = { daysRemaining, expiresOn }
+    │
+    ├── 计算属性
+    │   ├── tlsInfo() → 检查 tlsInfoList[monitor.id]?.certInfo
+    │   └── domainInfo() → 返回 domainInfoList[monitor.id] || null
+    │
+    └── 模板渲染
+        ├── v-if="tlsInfo" → 显示证书摘要
+        ├── v-if="domainInfo" → 显示域名摘要
+        └── 点击 → 显示 CertificateInfo 组件（证书链详情）
+```
+
+### 8.2 域名过期监控完整时序
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           域名过期监控端到端时序                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+时间轴 →
+│
+├── T1: 心跳检测成功
+│   │
+│   └── 条件检查：bean.status !== MAINTENANCE && Boolean(domainExpiryNotification)
+│       │
+│       └── ✅ 满足 → 执行域名过期检查
+│           │
+│           ├── DomainExpiry.checkSupport(monitor)
+│           │   └── 检查 monitor.type 是否在 TYPES_WITH_DOMAIN_EXPIRY_SUPPORT_VIA_FIELD
+│           │
+│           └── DomainExpiry.checkExpiry(domainName)
+│
+├── T2: RDAP 查询（可选，有缓存）
+│   │
+│   └── DomainExpiry.checkExpiry(domainName)
+│       │
+│       ├── 检查 lastCheck（24 小时缓存）
+│       │   ├── ✅ 24 小时内 → 直接返回 bean.expiry
+│       │   └── ❌ 超过 24 小时 → 执行 RDAP 查询
+│       │
+│       ├── getRdapDnsData()
+│       │   ├── 检查缓存（7 天有效）
+│       │   ├── 无缓存 → fetch https://data.iana.org/rdap/dns.json
+│       │   └── 失败 → 使用内置数据 (extra/rdap-dns.json)
+│       │
+│       ├── getRdapServer(tld)
+│       │   └── 根据 TLD 查找 RDAP 服务器 URL
+│       │
+│       └── getRdapDomainExpiryDate(domain)
+│           ├── 请求 {rdapServer}/domain/{domain}
+│           └── 查找 events 数组中 eventAction="expiration" 的日期
+│
+├── T3: 数据更新
+│   │
+│   └── checkExpiry() 继续
+│       │
+│       ├── 检查：新日期 > 旧日期？（域名是否续费）
+│       │   └── ✅ 是 → lastExpiryNotificationSent = null
+│       │
+│       └── 更新 domain_expiry 表
+│           ├── expiry = 新日期
+│           └── lastCheck = 当前时间
+│
+├── T4: 告警检查
+│   │
+│   └── DomainExpiry.sendNotifications(domainName, notificationList)
+│       │
+│       ├── 获取 notifyDays（默认 [7, 14, 21]）
+│       ├── 升序排序：notifyDays.sort((a, b) => a - b)
+│       │
+│       ├── 遍历每个 targetDays
+│       │   ├── 检查 daysRemaining > targetDays
+│       │   │   └── ✅ 是 → 跳过
+│       │   │
+│       │   ├── 检查 lastSent && lastSent <= targetDays（防重）
+│       │   │   └── ✅ 是 → 跳过
+│       │   │
+│       │   └── ✅ 都不满足 → 发送通知
+│       │
+│       └── sendDomainNotificationByTargetDays()
+│           ├── 遍历 notificationList
+│           ├── 调用 Notification.send()
+│           └── ✅ 发送成功 → 记录 lastExpiryNotificationSent = targetDays
+│           └── 立即 return（只发送一次最紧急的）
+│
+├── T5: 前端数据推送
+│   │
+│   └── sendStats() 中的 sendDomainInfo()
+│       │
+│       ├── DomainExpiry.checkSupport(monitor)
+│       │   └── 不检查 domainExpiryNotification！
+│       │
+│       └── DomainExpiry.findByDomainNameOrCreate(supportInfo.domain)
+│           └── ✅ 有 expiry 数据 → socket.emit("domainInfo", ...)
+│
+└── T6: 前端展示
+    │
+    └── 同证书监控流程
+        ├── socket.on("domainInfo") → domainInfoList[monitorID] = { ... }
+        ├── domainInfo() 计算属性
+        └── v-if="domainInfo" → 显示域名过期摘要
+```
+
+### 8.3 徽章 API 时序
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           Badge API 端到端时序                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+时间轴 →
+│
+├── T1: HTTP 请求到达
+│   │
+│   └── GET /api/badge/:id/cert-exp
+│       │
+│       ├── cache("5 minutes") → 检查缓存
+│       │   ├── ✅ 有缓存 → 直接返回
+│       │   └── ❌ 无缓存 → 继续处理
+│       │
+│       ├── 解析参数
+│       │   ├── warnDays（默认 14）
+│       │   ├── downDays（默认 7）
+│       │   ├── upColor / warnColor / downColor
+│       │   └── ...
+│       │
+│       └── 检查监控是否公开
+│
+├── T2: 数据查询
+│   │
+│   ├── ❌ 监控不公开
+│   │   ├── message = "N/A"
+│   │   └── color = naColor (#999)
+│   │
+│   └── ✅ 监控公开
+│       │
+│       ├── 查询 monitor_tls_info 表
+│       │   │
+│       │   ├── ❌ 无记录
+│       │   │   ├── message = "No/Bad Cert"
+│       │   │   └── color = naColor
+│       │   │
+│       │   └── ✅ 有记录
+│       │       │
+│       │       ├── 检查 tlsInfo.valid
+│       │       │   └── ❌ 无效
+│       │       │       ├── message = "Bad Cert"
+│       │       │       └── color = downColor
+│       │       │
+│       │       └── ✅ 有效 → 区间判断颜色
+│       │           │
+│       │           ├── daysRemaining > warnDays?
+│       │           │   └── ✅ 是 → color = upColor（绿色）
+│       │           │
+│       │           ├── daysRemaining > downDays?
+│       │           │   └── ✅ 是 → color = warnColor（黄色）
+│       │           │
+│       │           └── ❌ 否则 → color = downColor（红色）
+│       │
+│       └── message = `${daysRemaining} days`
+│
+├── T3: 生成 SVG 徽章
+│   │
+│   └── makeBadge(badgeValues) → 返回 SVG 图像
+│
+└── T4: 缓存响应
+    │
+    └── cache("5 minutes") → 缓存 5 分钟内的相同请求
+```
+
+---
+
+## 9. 关键代码位置汇总
+
+### 9.1 后端代码
 
 | 功能模块 | 文件路径 | 关键函数/类 |
 |---------|---------|------------|
@@ -1143,6 +1705,7 @@ router.get("/api/badge/:id/cert", cache("5 minutes"), async (request, response) 
 | 监控主模型 | `server/model/monitor.js` | `class Monitor` |
 | TLS 信息处理 | `server/model/monitor.js:2096-2104` | `handleTlsInfo()` |
 | TLS 信息保存 | `server/model/monitor.js:1292-1328` | `updateTlsInfo()` |
+| 证书通知发送 | `server/model/monitor.js:1578-1614` | `sendCertNotificationByTargetDays()` |
 | 证书信息推送 | `server/model/monitor.js:1386-1391` | `sendCertInfo()` |
 | 域名信息推送 | `server/model/monitor.js:1400-1410` | `sendDomainInfo()` |
 | TCP/TLS 监控 | `server/monitor-types/tcp.js` | `class TCPMonitorType` |
@@ -1153,17 +1716,21 @@ router.get("/api/badge/:id/cert", cache("5 minutes"), async (request, response) 
 | 域名过期查询 | `server/model/domain_expiry.js:110-140` | `getRdapDomainExpiryDate()` |
 | 域名过期检查 | `server/model/domain_expiry.js:278-302` | `checkExpiry()` |
 | 域名过期通知 | `server/model/domain_expiry.js:309-365` | `sendNotifications()` |
+| 徽章 API | `server/routers/api-router.js:424-505` | `/api/badge/:id/cert-exp` |
 
-### 7.2 前端代码
+### 9.2 前端代码
 
 | 功能模块 | 文件路径 | 关键组件/函数 |
 |---------|---------|--------------|
 | 证书信息展示 | `src/components/CertificateInfo.vue` | `CertificateInfo` 组件 |
 | 证书链展示 | `src/components/CertificateInfoRow.vue` | `CertificateInfoRow` 组件 |
-| Socket 事件监听 | `src/mixins/socket.js:252-258` | `certInfo`, `domainInfo` 事件 |
-| 详情页展示 | `src/pages/Details.vue` | `tlsInfo`, `domainInfo` 计算属性 |
+| Socket 事件监听 | `src/mixins/socket.js:52,252-258` | `certInfo`, `domainInfo` 事件 |
+| 详情页计算属性 | `src/pages/Details.vue:560-580` | `tlsInfo`, `domainInfo` 计算属性 |
+| 详情页模板 | `src/pages/Details.vue:253-295` | `v-if="tlsInfo"`, `v-if="domainInfo"` |
+| 支持域名过期的监控类型 | `src/util.ts:776-781` | `TYPES_WITH_DOMAIN_EXPIRY_SUPPORT_VIA_FIELD` |
+| 徽章常量 | `src/util.ts:143-161` | `badgeConstants` |
 
-### 7.3 数据库
+### 9.3 数据库
 
 | 表名 | 用途 | 关键字段 |
 |------|------|----------|
@@ -1171,163 +1738,33 @@ router.get("/api/badge/:id/cert", cache("5 minutes"), async (request, response) 
 | `domain_expiry` | 存储域名过期信息 | `domain`, `expiry`, `lastCheck`, `lastExpiryNotificationSent` |
 | `notification_sent_history` | 通知发送历史 | `type`, `monitor_id`, `days` |
 
-### 7.4 配置项
+### 9.4 配置项
 
 | 配置项 | 默认值 | 用途 |
 |--------|--------|------|
-| `tlsExpiryNotifyDays` | `[7, 14, 21]` | 证书过期告警天数 |
-| `domainExpiryNotifyDays` | `[7, 14, 21]` | 域名过期告警天数 |
+| `tlsExpiryNotifyDays` | `[7, 14, 21]` | 证书过期告警天数（通知发送） |
+| `domainExpiryNotifyDays` | `[7, 14, 21]` | 域名过期告警天数（通知发送） |
 | `rdapDnsData` | 内置数据 | IANA RDAP 服务器列表 |
+| `defaultCertExpireWarnDays` | `14` | 徽章黄色警告阈值 |
+| `defaultCertExpireDownDays` | `7` | 徽章红色危险阈值 |
+| `defaultUpColor` | `#66c20a` | 徽章绿色（正常） |
+| `defaultWarnColor` | `#eed202` | 徽章黄色（警告） |
+| `defaultDownColor` | `#c2290a` | 徽章红色（危险） |
 
 ---
 
-## 8. 流程图总结
+## 10. 关键技术点
 
-### 8.1 证书监控完整流程
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           HTTPS 证书监控流程                                   │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-1. 采集阶段
-   ┌──────────────┐
-   │  HTTP 监控   │───── keylog/secureConnect 事件 ─────┐
-   └──────────────┘                                        │
-   ┌──────────────┐                                        ▼
-   │  TCP/TLS 监控│───── tls.connect() ──────────────▶ TLS Socket
-   └──────────────┘                                        │
-   ┌──────────────┐                                        │
-   │ STARTTLS    │───── 协议命令 → 升级 TLS ────────────┘
-   └──────────────┘
-                           │
-                           ▼
-2. 解析阶段
-   ┌─────────────────────────────────────────────────────┐
-   │ checkCertificate(socket)                             │
-   │   ├── socket.getPeerCertificate(true)  // 获取证书链 │
-   │   └── parseCertificateInfo(info)       // 解析元数据 │
-   │       ├── 转换 valid_to → Date 对象                  │
-   │       ├── 计算 daysRemaining (UTC)                  │
-   │       ├── 识别 certType (server/intermediate/root)  │
-   │       └── 提取 validFor (SAN 域名)                   │
-   └─────────────────────────────────────────────────────┘
-                           │
-                           ▼
-3. 保存阶段
-   ┌─────────────────────────────────────────────────────┐
-   │ handleTlsInfo(tlsInfo)                               │
-   │   ├── updateTlsInfo()                                │
-   │   │   ├── 检查证书指纹是否变更                         │
-   │   │   ├── 变更则清除 notification_sent_history        │
-   │   │   └── JSON.stringify → monitor_tls_info 表      │
-   │   ├── prometheus.update()  // 更新指标               │
-   │   └── checkCertExpiryNotifications() // 检查告警     │
-   └─────────────────────────────────────────────────────┘
-                           │
-                           ▼
-4. 告警阶段
-   ┌─────────────────────────────────────────────────────┐
-   │ checkCertExpiryNotifications()                      │
-   │   ├── 获取配置的通知天数 [7, 14, 21]                │
-   │   ├── 遍历证书链中的每个证书                          │
-   │   │   ├── 跳过已知的根证书 (rootCertificates)        │
-   │   │   ├── 检查 daysRemaining <= targetDays          │
-   │   │   └── 检查 notification_sent_history 防重复      │
-   │   └── 发送通知 (Email/Slack/Telegram 等)            │
-   └─────────────────────────────────────────────────────┘
-                           │
-                           ▼
-5. 展示阶段
-   ┌─────────────────────────────────────────────────────┐
-   │ 前端展示                                             │
-   │   ├── Socket.io 接收 certInfo 事件                   │
-   │   │   └── 存储到 this.tlsInfoList[monitorID]        │
-   │   ├── Details.vue 显示摘要                           │
-   │   │   ├── 剩余天数 (可点击展开)                      │
-   │   │   ├── 过期日期                                   │
-   │   │   └── 主机名不匹配警告图标                       │
-   │   └── CertificateInfo.vue 显示详情                   │
-   │       ├── 证书链 (递归显示)                          │
-   │       ├── 主题、颁发者、指纹、有效期                  │
-   │       └── 证书类型标签                               │
-   └─────────────────────────────────────────────────────┘
-```
-
-### 8.2 域名过期监控完整流程
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           域名过期监控流程                                     │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-1. 触发时机
-   ┌─────────────────────────────────────────────────────┐
-   │ 每次心跳成功后，检查 monitor.domainExpiryNotification │
-   │ 是否已启用                                           │
-   └─────────────────────────────────────────────────────┘
-                           │
-                           ▼
-2. RDAP 服务器发现
-   ┌─────────────────────────────────────────────────────┐
-   │ getRdapDnsData()                                    │
-   │   ├── 检查本地缓存 (一周有效)                        │
-   │   ├── 无缓存则从 IANA 获取:                          │
-   │   │   https://data.iana.org/rdap/dns.json          │
-   │   └── 失败则使用内置数据 (extra/rdap-dns.json)      │
-   └─────────────────────────────────────────────────────┘
-                           │
-                           ▼
-3. 查询过期日期
-   ┌─────────────────────────────────────────────────────┐
-   │ DomainExpiry.checkExpiry(domainName)                │
-   │   ├── 检查上次查询时间 (24小时缓存)                   │
-   │   ├── getRdapDomainExpiryDate()                     │
-   │   │   ├── 根据 TLD 查找 RDAP 服务器                  │
-   │   │   ├── 请求: {rdapServer}/domain/{domain}        │
-   │   │   └── 在 events 数组中查找 eventAction=expiration │
-   │   ├── 更新 domain_expiry 表:                         │
-   │   │   ├── expiry (过期日期)                          │
-   │   │   └── lastCheck (上次查询时间)                   │
-   │   └── 日期延后则清除 lastExpiryNotificationSent      │
-   └─────────────────────────────────────────────────────┘
-                           │
-                           ▼
-4. 告警检查
-   ┌─────────────────────────────────────────────────────┐
-   │ DomainExpiry.sendNotifications()                    │
-   │   ├── 获取配置的通知天数 [7, 14, 21]                │
-   │   ├── 升序排列，确保只发送最紧急的一次                │
-   │   ├── 检查 daysRemaining <= targetDays              │
-   │   ├── 检查 lastExpiryNotificationSent 防重复         │
-   │   └── 发送通知                                       │
-   └─────────────────────────────────────────────────────┘
-                           │
-                           ▼
-5. 前端展示
-   ┌─────────────────────────────────────────────────────┐
-   │ 前端展示                                             │
-   │   ├── Socket.io 接收 domainInfo 事件                 │
-   │   │   └── 存储到 this.domainInfoList[monitorID]      │
-   │   └── Details.vue 显示:                              │
-   │       ├── 剩余天数                                   │
-   │       └── 过期日期                                   │
-   └─────────────────────────────────────────────────────┘
-```
-
----
-
-## 9. 关键技术点
-
-### 9.1 时间处理
+### 10.1 时间处理
 
 - **统一使用 UTC 时间**：所有日期计算都使用 `dayjs.utc()` 避免时区问题
 - **证书有效期**：`validTo` 使用 Date 对象存储，`daysRemaining` 实时计算
 - **缓存策略**：
   - RDAP DNS 数据：缓存 7 天
   - 域名过期查询：缓存 24 小时
+  - 徽章 API：缓存 5 分钟
 
-### 9.2 证书链处理
+### 10.2 证书链处理
 
 - **递归解析**：通过 `issuerCertificate` 字段遍历完整证书链
 - **类型识别**：
@@ -1336,39 +1773,159 @@ router.get("/api/badge/:id/cert", cache("5 minutes"), async (request, response) 
   - 自签名或无上级 = `root CA` 或 `self-signed`
 - **指纹对比**：使用 `fingerprint256` 检测证书是否更新
 
-### 9.3 防重复告警
+### 10.3 防重复告警机制
 
-- **证书**：使用 `notification_sent_history` 表，唯一键 `(type, monitor_id, days)`
-- **域名**：使用 `domain_expiry.lastExpiryNotificationSent` 字段
-- **证书更新**：指纹变更时自动清除历史记录
+#### 10.3.1 证书通知防重
 
-### 9.4 性能优化
+- **存储位置**：`notification_sent_history` 表
+- **查询条件**：`days <= targetDays`（累积防重）
+- **记录值**：`targetDays`（目标天数），不是 `daysRemaining`
 
-- **缓存机制**：RDAP 数据、域名查询结果都有缓存
+#### 10.3.2 域名通知防重
+
+- **存储位置**：`domain_expiry.lastExpiryNotificationSent` 字段
+- **查询条件**：`lastSent <= targetDays`（累积防重）
+- **记录值**：`targetDays`（目标天数）
+
+#### 10.3.3 关键差异
+
+| 特性 | 证书过期 | 域名过期 |
+|------|----------|----------|
+| 排序 | ❌ 无排序 | ✅ 升序排序 |
+| 发送后返回 | 继续遍历 | 立即 `return` |
+
+> **潜在问题**：证书过期检查没有排序。如果用户自定义 `notifyDays = [21, 14, 7]`，可能导致发送 3 次通知。
+
+### 10.4 三套独立机制
+
+| 机制 | 判断逻辑 | 阈值来源 |
+|------|----------|----------|
+| **通知发送** | `daysRemaining <= targetDays` | `tlsExpiryNotifyDays` / `domainExpiryNotifyDays` |
+| **徽章展示** | 区间判断 | `defaultCertExpireWarnDays` / `defaultCertExpireDownDays` |
+| **页面展示** | 数据存在性 | 无专用阈值 |
+
+### 10.5 性能优化
+
+- **缓存机制**：RDAP 数据、域名查询结果、徽章响应都有缓存
 - **异步处理**：通知发送不阻塞主监控流程
 - **按需查询**：只有启用了过期通知的监控才会执行相关检查
+- **快速失败**：无通知配置时直接跳过告警检查
 
 ---
 
-## 10. 配置与扩展
+## 11. 配置与扩展
 
-### 10.1 告警天数配置
+### 11.1 告警天数配置
 
 通过 Settings 表配置，默认值：
-- 证书：`[7, 14, 21]` 天
-- 域名：`[7, 14, 21]` 天
+- 证书通知：`[7, 14, 21]` 天
+- 域名通知：`[7, 14, 21]` 天
 
-### 10.2 支持的域名后缀
+### 11.2 徽章阈值配置
+
+徽章阈值是硬编码常量（可通过 URL 参数覆盖）：
+- `warnDays`（黄色）：默认 14 天
+- `downDays`（红色）：默认 7 天
+
+### 11.3 支持的域名后缀
 
 通过 IANA 的 RDAP DNS 数据动态支持，常见 TLD 如 `.com`, `.net`, `.org`, `.io` 等都支持。
 
-### 10.3 支持的 STARTTLS 协议
+### 11.4 支持的 STARTTLS 协议
 
 - SMTP (邮件)
 - IMAP (邮件)
 - XMPP (即时通讯)
 
+### 11.5 支持域名过期监控的类型
+
+```javascript
+const TYPES_WITH_DOMAIN_EXPIRY_SUPPORT_VIA_FIELD = {
+    http: "url",
+    keyword: "url",
+    "json-query": "url",
+    "real-browser": "url",
+    "websocket-upgrade": "url",
+};
+```
+
 ---
 
 *文档生成时间：2026-05-04*
 *基于 Uptime Kuma 代码库分析*
+
+---
+
+## 修订记录
+
+### v2.0（2026-05-04）
+
+**修正内容**：
+
+1. **前端 domainInfo 展示条件**
+   - 修正：原文档错误描述 `domainInfo()` 检查 `monitor.domainExpiryNotification`
+   - 实际：`domainInfo()` 只检查 `domainInfoList` 中是否有数据
+   - `domainExpiryNotification` 只影响通知发送和 RDAP 查询，不影响数据推送和展示
+
+2. **证书通知防重逻辑**
+   - 强调查询条件是 `days <= targetDays`，不是 `days = targetDays`
+   - 这是一个"累积防重"逻辑
+   - 记录的是 `targetDays`，不是 `daysRemaining`
+
+3. **增加告警状态边界关系分析（第7章）**
+   - 明确通知发送、页面展示、徽章展示是三套独立机制
+   - 对比三套机制的阈值、判断逻辑、用途
+   - 分析关键边界情况
+
+4. **增加端到端时序说明（第8章）**
+   - 证书监控完整时序（T1-T6）
+   - 域名过期监控完整时序（T1-T6）
+   - 徽章 API 完整时序（T1-T4）
+
+5. **发现潜在问题**
+   - 证书过期检查没有对 `notifyDays` 进行排序
+   - 域名过期检查明确进行了升序排序，并有注释说明
+   - 如果用户自定义 `notifyDays = [21, 14, 7]`，证书可能发送 3 次通知
+
+---
+
+### v2.1（2026-05-04）
+
+**深入校正内容**：
+
+1. **`TYPES_WITH_DOMAIN_EXPIRY_SUPPORT_VIA_FIELD` 完整列表**
+   - 原文档只记录了 5 种类型（http, keyword, json-query, real-browser, websocket-upgrade）
+   - 实际支持 18 种类型，使用 3 种不同字段：
+     - `url` 字段：http, keyword, json-query, real-browser, websocket-upgrade
+     - `hostname` 字段：port, ping, dns, smtp, snmp, gamedig, steam, mqtt, radius, tailscale-ping, sip-options
+     - `grpcUrl` 字段：grpc-keyword
+
+2. **`checkSupport` 完整逻辑**
+   - 检查 1：`monitor.type` 是否在支持列表中
+   - 检查 2：目标字段是否有值
+   - 检查 3：是否是 ICANN 域名（`tld.isIcann`）
+   - 检查 4：是否有 RDAP 服务器
+   - 任一检查失败都会抛出异常，`sendDomainInfo` 会静默忽略
+
+3. **`domainExpiryNotification` 影响范围校正**
+   - ❌ **不影响**：数据推送 (`sendDomainInfo`)、页面展示 (`v-if="domainInfo"`)
+   - ✅ **影响**：RDAP 查询 (`checkExpiry`)、通知发送 (`sendNotifications`)
+
+4. **关键边界场景**
+   - **场景 A**：新监控 + `domainExpiryNotification = false`
+     - `findByDomainNameOrCreate` 创建新记录，但 `expiry` 为 null
+     - `domain?.expiry` 为 null，不推送数据
+     - 前端不显示
+   - **场景 B**：曾经启用过，现在关闭
+     - 数据库中已有 `expiry` 数据
+     - `sendDomainInfo` 检查 `domain?.expiry` 为 true
+     - 继续推送数据，前端继续显示
+   - **场景 C**：TCP 端口监控 + `domainExpiryNotification = false`
+     - 类型支持（`port` 在列表中）
+     - 但不会执行 RDAP 查询
+     - 除非数据库已有数据，否则不显示
+
+5. **`findByDomainNameOrCreate` 逻辑**
+   - 先查找现有记录
+   - 没有记录且 `domainName` 存在时，创建新记录
+   - 新创建的记录 `expiry` 为 null，不会触发推送
