@@ -594,7 +594,7 @@ get daysRemaining() {
 
 ### 4.3 支持的监控类型
 
-**位置**：`src/util.ts:776-781` 中定义的 `TYPES_WITH_DOMAIN_EXPIRY_SUPPORT_VIA_FIELD`
+**位置**：`src/util.ts:776-794` 中定义的 `TYPES_WITH_DOMAIN_EXPIRY_SUPPORT_VIA_FIELD`
 
 ```javascript
 export const TYPES_WITH_DOMAIN_EXPIRY_SUPPORT_VIA_FIELD = {
@@ -603,10 +603,68 @@ export const TYPES_WITH_DOMAIN_EXPIRY_SUPPORT_VIA_FIELD = {
     "json-query": "url",
     "real-browser": "url",
     "websocket-upgrade": "url",
-};
+    port: "hostname",
+    ping: "hostname",
+    "grpc-keyword": "grpcUrl",
+    dns: "hostname",
+    smtp: "hostname",
+    snmp: "hostname",
+    gamedig: "hostname",
+    steam: "hostname",
+    mqtt: "hostname",
+    radius: "hostname",
+    "tailscale-ping": "hostname",
+    "sip-options": "hostname",
+} as const;
 ```
 
-只有特定类型的监控支持域名过期检查，需要从监控配置中提取域名。
+**支持的类型和对应字段**：
+
+| 字段 | 监控类型 |
+|------|----------|
+| `url` | http, keyword, json-query, real-browser, websocket-upgrade |
+| `hostname` | port, ping, dns, smtp, snmp, gamedig, steam, mqtt, radius, tailscale-ping, sip-options |
+| `grpcUrl` | grpc-keyword |
+
+### 4.3.1 `checkSupport` 完整逻辑
+
+**位置**：`server/model/domain_expiry.js:211-245`
+
+```javascript
+static async checkSupport(monitor) {
+    // 检查 1: 监控类型是否在支持列表中
+    if (!(monitor.type in TYPES_WITH_DOMAIN_EXPIRY_SUPPORT_VIA_FIELD)) {
+        throw new TranslatableError("domain_expiry_unsupported_monitor_type");
+    }
+    
+    // 检查 2: 目标字段是否有值
+    const targetField = TYPES_WITH_DOMAIN_EXPIRY_SUPPORT_VIA_FIELD[monitor.type];
+    const target = monitor[targetField];
+    if (typeof target !== "string" || target.length === 0) {
+        throw new TranslatableError("domain_expiry_unsupported_missing_target");
+    }
+    
+    // 检查 3: 是否是 ICANN 域名
+    const tld = parseTld(target);
+    if (!tld.isIcann) {
+        throw new TranslatableError("domain_expiry_unsupported_is_icann", {...});
+    }
+    
+    // 检查 4: 是否有 RDAP 服务器
+    const publicSuffix = tld.publicSuffix;
+    const rdap = await getRdapServer(publicSuffix);
+    if (!rdap) {
+        throw new TranslatableError("domain_expiry_unsupported_unsupported_tld_no_rdap_endpoint", {...});
+    }
+    
+    return {
+        domain: tld.domain,
+        tld: rootTld,
+    };
+}
+```
+
+**注意**：`sendDomainInfo` 会静默捕获 `checkSupport` 抛出的异常，所以即使类型不支持，也不会报错，只是不会推送数据。
 
 ### 4.4 监控触发时机
 
@@ -1315,13 +1373,16 @@ router.get("/api/badge/:id/cert-exp", cache("5 minutes"), async (request, respon
 
 ### 7.3 阈值对应关系（默认配置）
 
-| 剩余天数 | 通知发送 | 徽章颜色 | 页面展示 |
-|----------|----------|----------|----------|
-| > 21 天 | ❌ 不触发 | 🟢 绿色 | ✅ 显示 |
-| 15-21 天 | ✅ 21 天阈值 | 🟢 绿色 | ✅ 显示 |
-| 8-14 天 | ✅ 14 天阈值 | 🟡 黄色 | ✅ 显示 |
-| 1-7 天 | ✅ 7 天阈值 | 🔴 红色 | ✅ 显示 |
-| <= 0 天 | ✅ 所有阈值 | 🔴 红色 | ✅ 显示 |
+| 剩余天数 | 证书通知 | 域名通知 | 徽章颜色 | 页面展示 |
+|----------|----------|----------|----------|----------|
+| > 21 天 | ❌ 不触发 | ❌ 不触发 | 🟢 绿色 | ✅ 显示 |
+| 15-21 天 | ✅ 21 天阈值 | ✅ 21 天阈值 | 🟢 绿色 | ✅ 显示 |
+| 8-14 天 | ✅ 14 天阈值 | ✅ 14 天阈值 | 🟡 黄色 | ✅ 显示 |
+| 1-7 天 | ✅ 7 天阈值 | ✅ 7 天阈值 | 🔴 红色 | ✅ 显示 |
+| **0 天** | ⚠️ **跳过!** | ✅ 7 天阈值 | 🔴 红色 | ✅ 显示 |
+| < 0 天 (已过期) | ✅ 7 天阈值 | ✅ 7 天阈值 | 🔴 红色 | ✅ 显示 |
+
+**注意**：证书通知在 `daysRemaining = 0` 时会被跳过，详见 7.4.4 节分析。
 
 ### 7.4 关键边界情况
 
