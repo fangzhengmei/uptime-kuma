@@ -61,6 +61,43 @@ headers: {
 4. Content-Type（根据请求体编码格式决定）
 5. 默认 Accept 头
 
+#### 自定义 Headers 覆盖认证头的风险
+
+**重要安全警告**：由于用户自定义 headers 优先级最高，如果用户在自定义 headers 中包含 `Authorization` 字段，会**静默覆盖** Basic Auth 或 OAuth2 自动生成的认证头。
+
+**风险场景示例：**
+
+| 场景 | auth_method | 配置的自定义 headers | 实际发送的 Authorization | 结果 |
+|------|-------------|----------------------|-------------------------|------|
+| 风险 1 | `basic` | `{"Authorization": "Bearer invalid"}` | `Bearer invalid` | 覆盖正确的 Basic Auth，认证失败 |
+| 风险 2 | `oauth2-cc` | `{"Authorization": "Basic oldcred"}` | `Basic oldcred` | 覆盖有效的 OAuth2 token，认证失败 |
+| 风险 3 | `basic` | `{"authorization": "Test"}`（小写 key） | `Basic xxx`（未覆盖） | 大小写敏感，不会覆盖 |
+
+**技术原因分析：**
+
+```javascript
+// 代码中的展开顺序
+headers: {
+    Accept: "...",                              // 1
+    ...(contentType ? { "Content-Type": ... }), // 2
+    ...basicAuthHeader,                         // 3: { "Authorization": "Basic xxx" }
+    ...oauth2AuthHeader,                        // 4: { "Authorization": "Bearer yyy" }
+    ...(this.headers ? JSON.parse(this.headers) : {}),  // 5: 最高优先级
+},
+```
+`server/model/monitor.js:549-555`
+
+JavaScript 对象展开运算符的特性：**后面展开的属性会覆盖前面的同名属性**。
+
+**后果：**
+1. **静默失败**：没有任何错误提示，请求直接携带错误的认证信息
+2. **难以排查**：用户可能忘记自己在自定义 headers 中配置了 Authorization，导致调试困难
+3. **安全隐患**：如果自定义 headers 中的 Authorization 是敏感信息（如旧 token、硬编码凭证），可能意外暴露
+
+**建议：**
+- 如果使用 Basic Auth 或 OAuth2，避免在自定义 headers 中配置 `Authorization` 字段
+- 如需调试认证问题，先检查是否在自定义 headers 中配置了同名字段
+
 #### Content-Type 判定逻辑
 
 根据 `httpBodyEncoding` 字段决定：
@@ -241,11 +278,67 @@ if (this.proxy_id) {
 **关键逻辑：**
 1. 只有当 `this.proxy_id` 有值时才会尝试使用代理
 2. 代理必须满足 `proxy.active === true` 才会生效
-3. 使用自定义 agent 方式，**同时设置 `options.proxy = false` 禁用 axios 内置代理**
+3. **只有当使用代理时**，才设置 `options.proxy = false` 并设置自定义 agent
 
-### 4. 无代理时的默认 Agent
+### 4. 三种场景下的字段落值对比
 
-如果没有配置代理，会创建默认的 HTTP/HTTPS Agent：
+根据代码逻辑分析，三种场景的最终 `options` 字段值如下：
+
+| 场景 | proxy_id | proxy.active | options.proxy | options.httpAgent | options.httpsAgent | 实际请求方式 |
+|------|----------|--------------|---------------|-------------------|--------------------|-------------|
+| **场景 A：有代理且启用** | 有值 | `true` | `false` | 代理 Agent | 代理 Agent | 走代理 |
+| **场景 B：无代理** | `null/undefined` | - | `undefined`（未设置） | 默认 `http.Agent` | 默认 `HttpsCookieAgent` | 直连 |
+| **场景 C：有代理但禁用** | 有值 | `false` | `undefined`（未设置） | 默认 `http.Agent` | 默认 `HttpsCookieAgent` | 直连 |
+
+**代码执行路径详解：**
+
+```javascript
+// 初始 options 不包含 proxy、httpAgent、httpsAgent
+const options = {
+    url: this.url,
+    method: ...,
+    timeout: ...,
+    headers: ...,
+    // 注意：没有 proxy, httpAgent, httpsAgent
+};
+
+// ========== 代理判断逻辑 ==========
+if (this.proxy_id) {
+    const proxy = await R.load("proxy", this.proxy_id);
+    
+    if (proxy && proxy.active) {
+        // ========== 场景 A：有代理且启用 ==========
+        options.proxy = false;           // 只有这里设置 proxy: false
+        options.httpAgent = httpAgent;   // 代理 Agent
+        options.httpsAgent = httpsAgent; // 代理 Agent
+    }
+    // else: proxy 不存在或 active=false，不做任何设置
+    // 进入场景 C
+}
+// else: proxy_id 无值，不做任何设置
+// 进入场景 B
+
+// ========== 默认 Agent 创建 ==========
+if (!options.httpAgent) {
+    // 场景 B 和 C 会进入这里
+    options.httpAgent = new http.Agent(httpAgentOptions);
+}
+
+if (!options.httpsAgent) {
+    // 场景 B 和 C 会进入这里
+    options.httpsAgent = new HttpsCookieAgent(httpsCookieAgentOptions);
+}
+```
+`server/model/monitor.js:544-601`
+
+**重要结论：**
+1. **`options.proxy = false` 仅在"有代理且启用"时设置**，目的是禁用 axios 的内置代理机制（避免同时使用两套代理配置）
+2. **"无代理"和"代理被禁用"两种场景最终选项完全相同**：都使用默认 Agent 直连目标服务器
+3. **场景 B 和 C 的 `options.proxy` 是 `undefined`**，不是 `false`
+
+### 5. 无代理时的默认 Agent
+
+如果没有配置代理（或代理被禁用），会创建默认的 HTTP/HTTPS Agent：
 
 ```javascript
 if (!options.httpAgent) {
@@ -263,13 +356,13 @@ if (!options.httpsAgent) {
 ```
 `server/model/monitor.js:590-601`
 
-### 5. 代理 Agent 创建细节
+### 6. 代理 Agent 创建细节
 
 `Proxy.createAgents` 方法负责创建不同协议的代理 Agent：
 
 `server/proxy.js:91-158`
 
-#### 5.1 代理 URL 组装（含认证）
+#### 6.1 代理 URL 组装（含认证）
 
 ```javascript
 const proxyUrl = new URL(`${proxy.protocol}://${proxy.host}:${proxy.port}`);
@@ -284,7 +377,7 @@ if (proxy.auth) {
 **代理认证信息会编码到 URL 中**，格式为：
 `protocol://username:password@host:port`
 
-#### 5.2 HTTP/HTTPS 协议代理
+#### 6.2 HTTP/HTTPS 协议代理
 
 使用 `http-proxy-agent` 和 `https-proxy-agent`：
 
@@ -306,7 +399,7 @@ case "https":
 ```
 `server/proxy.js:114-131`
 
-#### 5.3 SOCKS 协议代理
+#### 6.3 SOCKS 协议代理
 
 使用 `socks-proxy-agent`，**HTTP 和 HTTPS 共用同一个 Agent**：
 
@@ -447,6 +540,7 @@ static async delete(proxyID, userID) {
 │     - method: (this.method || "get").toLowerCase()              │
 │     - timeout: this.timeout * 1000 (毫秒)                        │
 │     - maxRedirects: this.maxredirects                            │
+│     注意：初始 options 不含 proxy、httpAgent、httpsAgent          │
 └─────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
@@ -473,6 +567,9 @@ static async delete(proxyID, userID) {
 │       ...oauth2AuthHeader,                     // 可覆盖上面      │
 │       ...JSON.parse(this.headers)              // 最高优先级       │
 │     }                                                           │
+│                                                                   │
+│     ⚠️  风险警告：如果自定义 headers 包含 Authorization，         │
+│         会静默覆盖 Basic Auth/OAuth2 生成的认证头！               │
 └─────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
@@ -487,7 +584,7 @@ static async delete(proxyID, userID) {
                                   │
                                   ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  5. 代理处理（优先级：请求级 proxy_id > 无代理）                   │
+│  5. 代理处理分支（三种场景的选项不同）                             │
 │                                                                  │
 │     ┌──────────────────────────────────────────────────────┐    │
 │     │ this.proxy_id 有值？                                  │    │
@@ -495,41 +592,41 @@ static async delete(proxyID, userID) {
 │              │                          │                         │
 │              │ Yes                      │ No                      │
 │              ▼                          ▼                         │
-│     ┌─────────────────┐        ┌─────────────────────┐         │
-│     │ 加载 proxy 配置  │        │ 创建默认 Agent       │         │
-│     │ 检查 active?     │        │ http.Agent +        │         │
-│     └─────────────────┘        │ HttpsCookieAgent    │         │
-│              │                  └─────────────────────┘         │
-│              │ Yes                      │                         │
-│              ▼                          ▼                         │
-│     ┌─────────────────┐               │                         │
-│     │ Proxy.          │               │                         │
-│     │ createAgents()  │◄──────────────┘                         │
-│     │                 │                                          │
-│     │ 根据协议创建    │                                          │
-│     │ - http/https:   │                                          │
-│     │   HttpProxyAgent│                                          │
-│     │   HttpsProxyAgent│                                         │
-│     │ - socks:         │                                          │
-│     │   SocksProxyAgent│                                         │
-│     │   (共用)         │                                          │
+│     ┌─────────────────┐        ┌─────────────────────────┐     │
+│     │ 加载 proxy 配置  │        │ 场景 B：无代理           │     │
+│     │ 检查 active?     │        │                         │     │
+│     └─────────────────┘        │ options.proxy: undefined │     │
+│              │                  │ httpAgent: 默认          │     │
+│              │                  │ httpsAgent: 默认         │     │
+│              ▼                  └─────────────────────────┘     │
+│     ┌─────────────────┐                                          │
+│     │ proxy.active    │                                          │
+│     │ === true ?      │                                          │
 │     └─────────────────┘                                          │
-│              │                                                    │
-│              ▼                                                    │
-│     options.proxy = false  // 禁用 axios 内置代理                │
-│     options.httpAgent = httpAgent                                │
-│     options.httpsAgent = httpsAgent                              │
+│         │         │                                               │
+│         │ Yes     │ No                                            │
+│         ▼         ▼                                               │
+│ ┌─────────────┐ ┌─────────────────────────┐                      │
+│ │场景 A：     │ │ 场景 C：代理被禁用       │                      │
+│ │有代理且启用 │ │                         │                      │
+│ │             │ │ options.proxy: undefined│                      │
+│ │options.proxy│ │ httpAgent: 默认         │                      │
+│ │  = false    │ │ httpsAgent: 默认        │                      │
+│ │httpAgent:   │ └─────────────────────────┘                      │
+│ │  代理 Agent  │                                                    │
+│ │httpsAgent:  │                                                    │
+│ │  代理 Agent  │                                                    │
+│ └─────────────┘                                                    │
 └─────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  6. 最终请求选项                                                   │
-│     {                                                             │
-│       url, method, timeout, headers,                             │
-│       maxRedirects, validateStatus, signal,                      │
-│       data (可选), params (可选，cacheBust),                     │
-│       proxy: false,  // 总是 false，用 agent 控制代理           │
-│       httpAgent, httpsAgent                                       │
+│  6. 默认 Agent 兜底（场景 B 和 C 进入）                           │
+│     if (!options.httpAgent) {                                    │
+│         options.httpAgent = new http.Agent(...);                │
+│     }                                                             │
+│     if (!options.httpsAgent) {                                   │
+│         options.httpsAgent = new HttpsCookieAgent(...);         │
 │     }                                                             │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -544,7 +641,7 @@ static async delete(proxyID, userID) {
 | HTTP 方法 | `method` | `options.method` | `"get"` | GET/POST/PUT 等 |
 | 超时 | `timeout` | `options.timeout` (ms) | 动态计算 | 秒为单位 |
 | 最大重定向 | `maxredirects` | `options.maxRedirects` | - | |
-| 自定义 Headers | `headers` (JSON 字符串) | `options.headers` 展开 | `{}` | 最高优先级 |
+| 自定义 Headers | `headers` (JSON 字符串) | `options.headers` 展开 | `{}` | **最高优先级，可覆盖认证头** |
 | 认证方式 | `auth_method` | 多种 | - | `basic`/`oauth2-cc`/`mtls` |
 | Basic Auth 用户 | `basic_auth_user` | Authorization 头 | - | |
 | Basic Auth 密码 | `basic_auth_pass` | Authorization 头 | - | |
@@ -618,23 +715,30 @@ static async delete(proxyID, userID) {
                │            │
                ▼            ▼
     ┌──────────────────┐  ┌────────────────┐
-    │ 加载 proxy 配置   │  │ 创建默认 Agent │
-    │ FROM proxy 表    │  │ （无代理）      │
-    └──────────────────┘  └────────────────┘
-               │
-               ▼
-    ┌────────────────────────┐
-    │ proxy.active === true? │
-    └────────────────────────┘
-               │            │
-              Yes          No
-               │            │
-               ▼            ▼
-    ┌──────────────────┐  ┌────────────────┐
-    │ Proxy.           │  │ 创建默认 Agent │
-    │ createAgents()   │  │ （无代理，      │
-    │ 走代理请求        │  │  代理被禁用）   │
-    └──────────────────┘  └────────────────┘
+    │ 加载 proxy 配置   │  │ 场景 B：无代理  │
+    │ FROM proxy 表    │  │ options.proxy: │
+    └──────────────────┘  │ undefined      │
+               │           │ httpAgent:    │
+               ▼           │ 默认           │
+    ┌────────────────────┐ │ httpsAgent:   │
+    │ proxy.active ===   │ │ 默认           │
+    │ true ?             │ └────────────────┘
+    └────────────────────┘
+           │            │
+          Yes          No
+           │            │
+           ▼            ▼
+    ┌────────────────┐ ┌──────────────────┐
+    │ 场景 A：       │ │ 场景 C：          │
+    │ 有代理且启用   │ │ 代理被禁用        │
+    │                │ │                   │
+    │ options.proxy: │ │ options.proxy:    │
+    │ false          │ │ undefined         │
+    │ httpAgent:     │ │ httpAgent:        │
+    │ 代理 Agent     │ │ 默认              │
+    │ httpsAgent:    │ │ httpsAgent:       │
+    │ 代理 Agent     │ │ 默认              │
+    └────────────────┘ └──────────────────┘
 ```
 
 ---
@@ -662,7 +766,7 @@ static async delete(proxyID, userID) {
 
 ### 关于请求组装
 
-1. **Headers 采用展开覆盖**：用户自定义 headers 优先级最高，可以覆盖任何自动生成的头（包括 Authorization）
+1. **Headers 采用展开覆盖**：用户自定义 headers 优先级最高，**可以静默覆盖** Basic Auth 或 OAuth2 生成的 `Authorization` 头，存在安全和调试风险
 2. **多种认证方式**：Basic Auth、OAuth2、mTLS 三种认证是互斥的（通过 `auth_method` 选择）
 3. **超时双重保险**：axios timeout + abort signal，后者比前者多 10 秒缓冲
 4. **证书校验默认开启**：`ignoreTls` 默认为 false，即 `rejectUnauthorized = true`
@@ -672,10 +776,20 @@ static async delete(proxyID, userID) {
 1. **默认代理只影响新建**："默认代理"的概念**仅存在于前端创建监控的 UI 逻辑中**
 2. **运行时不认识"默认"**：后端执行请求时，只看 `monitor.proxy_id` 是否有值，完全不关心 `proxy.default` 标记
 3. **保存即固化**：一旦监控保存，`proxy_id` 就固定了，之后修改"默认代理"不会影响已存在的监控
-4. **代理禁用 = 无代理**：如果监控配置了代理但该代理被标记为 `active: false`，请求会绕过代理直接发送
-5. **删除代理 = 无代理**：删除代理时，所有使用该代理的监控的 `proxy_id` 会被置为 `null`
+4. **三种场景的 `options.proxy` 值不同**：
+   - 有代理且启用：`options.proxy = false`
+   - 无代理 / 代理被禁用：`options.proxy = undefined`（未设置）
+5. **代理禁用 = 无代理**：如果监控配置了代理但该代理被标记为 `active: false`，请求会绕过代理直接发送（与"无代理"场景完全相同）
+6. **删除代理 = 无代理**：删除代理时，所有使用该代理的监控的 `proxy_id` 会被置为 `null`
 
 ### 关于代理认证
 
 1. **代理认证信息在 URL 中**：`protocol://username:password@host:port`
 2. **与目标服务认证分开**：代理认证（proxy.username/password）和目标服务认证（Basic Auth/OAuth2/mTLS）是两个独立的概念，互不干扰
+
+### 修正说明
+
+本文档修正了原结论中关于 `options.proxy` 字段的不准确描述：
+
+- ❌ 原错误描述：`options.proxy` 总是 `false`
+- ✅ 正确描述：`options.proxy = false` **仅在"有代理且启用"时设置**，目的是禁用 axios 内置代理机制；"无代理"和"代理被禁用"场景下 `options.proxy` 为 `undefined`
