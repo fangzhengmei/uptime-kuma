@@ -18,8 +18,118 @@ server.js:237
 
 server.js:337
     └── app.get("/metrics", apiAuth, prometheusAPIMetrics())
-            └── 注册 /metrics 端点，使用第一个用户的 Basic Auth
+            └── 注册 /metrics 端点，鉴权逻辑按配置分支
 ```
+
+### 1.3 /metrics 鉴权分支逻辑
+
+**核心代码**: `server/auth.js:155-176`
+
+```javascript
+exports.apiAuth = async function (req, res, next) {
+    if (!(await Settings.get("disableAuth"))) {
+        let usingAPIKeys = await Settings.get("apiKeysEnabled");
+        if (usingAPIKeys) {
+            // 模式1: API Key 鉴权
+            middleware = basicAuth({ authorizer: apiAuthorizer, ... });
+        } else {
+            // 模式2: 用户密码鉴权
+            middleware = basicAuth({ authorizer: userAuthorizer, ... });
+        }
+        middleware(req, res, next);
+    } else {
+        // 模式3: 无鉴权
+        next();
+    }
+};
+```
+
+#### 鉴权模式分支图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    /metrics 端点请求到达                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│              检查 Settings.get("disableAuth")                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   disableAuth = true                          disableAuth = false           │
+│         │                                              │                      │
+│         ▼                                              ▼                      │
+│  ┌─────────────┐                    ┌─────────────────────────────────┐    │
+│  │  无鉴权      │                    │  检查 Settings.get("apiKeysEnabled") │    │
+│  │  直接通过     │                    └─────────────────────────────────┘    │
+│  │  next()     │                                   │                      │
+│  └─────────────┘                                   ▼                      │
+│                                          ┌─────────────────────────┐      │
+│                                          │                         │      │
+│                        apiKeysEnabled=true    apiKeysEnabled=false      │
+│                                 │                    │                      │
+│                                 ▼                    ▼                      │
+│                        ┌─────────────┐    ┌─────────────┐              │
+│                        │ API Key 模式 │    │ 用户密码模式 │              │
+│                        │ apiAuthorizer│    │userAuthorizer│              │
+│                        └─────────────┘    └─────────────┘              │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 三种鉴权模式详解
+
+| 模式 | 配置条件 | 认证方式 | 说明 |
+|------|----------|----------|------|
+| **模式1: 无鉴权** | `disableAuth = true` | 无 | 直接通过，不验证任何凭证 |
+| **模式2: 用户密码** | `disableAuth = false` 且 `apiKeysEnabled = false` | HTTP Basic Auth | 使用第一个用户的 username/password |
+| **模式3: API Key** | `disableAuth = false` 且 `apiKeysEnabled = true` | HTTP Basic Auth (特殊) | username 任意，password 填 API Key |
+
+#### 模式3: API Key 格式说明
+
+**代码位置**: `server/auth.js:41-63`
+
+API Key 格式: `uk{id}_{clearKey}`
+
+```
+示例: uk1_abc123def456xyz
+
+解析过程:
+- 前缀 "uk" (固定)
+- id: "1" (从第2个字符到 "_" 之前)
+- clearKey: "abc123def456xyz" ("_" 之后的部分)
+
+验证逻辑:
+1. 从数据库 api_key 表查找 id=1 的记录
+2. 检查 active 状态
+3. 检查过期时间 expiry
+4. bcrypt 验证 clearKey 与存储的 hash 匹配
+```
+
+**API Key 使用方式**:
+- HTTP Basic Auth 格式
+- **Username**: 任意值（代码中未使用，可填空或任意字符串）
+- **Password**: 完整的 API Key（如 `uk1_abc123def456xyz`）
+
+#### 配置项说明
+
+| 配置项 | 存储位置 | 如何设置 |
+|--------|----------|----------|
+| `disableAuth` | `setting` 表 | 管理后台 → 设置 → 认证 |
+| `apiKeysEnabled` | `setting` 表 | 创建第一个 API Key 时自动设为 `true` |
+
+#### 关键代码位置
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| apiAuth 中间件主逻辑 | `server/auth.js` | 155-176 |
+| API Key 验证函数 | `server/auth.js` | 41-63 |
+| API Key 授权器 | `server/auth.js` | 79-97 |
+| 用户密码授权器 | `server/auth.js` | 106-123 |
+| 创建 API Key 时启用配置 | `server/socket-handlers/api-key-socket-handler.js` | 37 |
+| /metrics 路由注册 | `server/server.js` | 337 |
+
+---
 
 ## 2. Metrics 定义
 
