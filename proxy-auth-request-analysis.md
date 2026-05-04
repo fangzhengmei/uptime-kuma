@@ -61,42 +61,189 @@ headers: {
 4. Content-Type（根据请求体编码格式决定）
 5. 默认 Accept 头
 
-#### 自定义 Headers 覆盖认证头的风险
+#### 自定义 Headers 与认证头的优先级分析
 
-**重要安全警告**：由于用户自定义 headers 优先级最高，如果用户在自定义 headers 中包含 `Authorization` 字段，会**静默覆盖** Basic Auth 或 OAuth2 自动生成的认证头。
+**重要发现：HTTP 监控和 WebSocket 监控的优先级逻辑相反**
 
-**风险场景示例：**
+---
 
-| 场景 | auth_method | 配置的自定义 headers | 实际发送的 Authorization | 结果 |
-|------|-------------|----------------------|-------------------------|------|
-| 风险 1 | `basic` | `{"Authorization": "Bearer invalid"}` | `Bearer invalid` | 覆盖正确的 Basic Auth，认证失败 |
-| 风险 2 | `oauth2-cc` | `{"Authorization": "Basic oldcred"}` | `Basic oldcred` | 覆盖有效的 OAuth2 token，认证失败 |
-| 风险 3 | `basic` | `{"authorization": "Test"}`（小写 key） | `Basic xxx`（未覆盖） | 大小写敏感，不会覆盖 |
+### 一、HTTP 监控的优先级（自定义 headers 优先级最高）
 
-**技术原因分析：**
+#### 代码分析（可复核推导）
+
+**代码位置**：`server/model/monitor.js:549-555`
 
 ```javascript
-// 代码中的展开顺序
-headers: {
-    Accept: "...",                              // 1
-    ...(contentType ? { "Content-Type": ... }), // 2
-    ...basicAuthHeader,                         // 3: { "Authorization": "Basic xxx" }
-    ...oauth2AuthHeader,                        // 4: { "Authorization": "Bearer yyy" }
-    ...(this.headers ? JSON.parse(this.headers) : {}),  // 5: 最高优先级
-},
+// Axios Options
+const options = {
+    // ...
+    headers: {
+        Accept: "text/html,application/xhtml+xml,...",
+        ...(contentType ? { "Content-Type": contentType } : {}),
+        ...basicAuthHeader,                         // 第 3 层：{ Authorization: "Basic xxx" }
+        ...oauth2AuthHeader,                        // 第 4 层：{ Authorization: "Bearer yyy" }
+        ...(this.headers ? JSON.parse(this.headers) : {}),  // 第 5 层：自定义 headers - 最后展开
+    },
+    // ...
+};
 ```
-`server/model/monitor.js:549-555`
 
-JavaScript 对象展开运算符的特性：**后面展开的属性会覆盖前面的同名属性**。
+#### JavaScript 对象展开运算符的精确行为
 
-**后果：**
-1. **静默失败**：没有任何错误提示，请求直接携带错误的认证信息
-2. **难以排查**：用户可能忘记自己在自定义 headers 中配置了 Authorization，导致调试困难
-3. **安全隐患**：如果自定义 headers 中的 Authorization 是敏感信息（如旧 token、硬编码凭证），可能意外暴露
+**推导过程**：
 
-**建议：**
-- 如果使用 Basic Auth 或 OAuth2，避免在自定义 headers 中配置 `Authorization` 字段
-- 如需调试认证问题，先检查是否在自定义 headers 中配置了同名字段
+JavaScript 规范中，对象展开运算符 `{...a, ...b}` 的行为是：
+1. 创建一个新对象
+2. 将 `a` 的所有可枚举属性复制到新对象
+3. 将 `b` 的所有可枚举属性复制到新对象
+4. **如果 `b` 中有与 `a` 同名的属性，`b` 的值会覆盖 `a` 的值**
+
+**关键特性**：JavaScript 对象的属性名（key）是**大小写敏感的**。
+
+#### HTTP 监控的覆盖判定表
+
+基于代码展开顺序，可以精确推导以下场景：
+
+| 场景 | auth_method | 自定义 headers | 代码展开顺序 | 结果 `headers.Authorization` | 说明 |
+|------|-------------|----------------|-------------|------------------------------|------|
+| 场景 A | `basic` | `{}` 或无 | 3 → 5 | `"Basic xxx"` | 无覆盖 |
+| 场景 B | `basic` | `{"Authorization": "Custom"}` | 3 → 5 | `"Custom"` | **自定义覆盖 Basic Auth** |
+| 场景 C | `oauth2-cc` | `{"Authorization": "Old"}` | 4 → 5 | `"Old"` | **自定义覆盖 OAuth2** |
+| 场景 D | `basic` | `{"authorization": "lowercase"}` | 3 → 5 | `"Basic xxx"` | **小写 key 不覆盖大写 key** |
+| 场景 E | `basic` | `{"AUTHORIZATION": "UPPERCASE"}` | 3 → 5 | `"Basic xxx"` | **大写 key 不覆盖首字母大写** |
+
+**注意**：场景 D 和 E 是基于 JavaScript 对象 key 大小写敏感的推导。axios 在发送请求时可能会对某些 headers 进行规范化（如 `content-type`），但 `Authorization` 头通常不会被规范化。
+
+---
+
+### 二、WebSocket 监控的优先级（认证头优先级最高）
+
+#### 代码分析（可复核推导）
+
+**代码位置**：`server/monitor-types/websocket-upgrade.js:66-96`
+
+```javascript
+async buildWsOptions(monitor) {
+    const options = {};
+    
+    // 第 1 步：先解析自定义 headers
+    if (monitor.headers) {
+        try {
+            options.headers = JSON.parse(monitor.headers);
+        } catch (e) {
+            options.headers = {};
+        }
+    } else {
+        options.headers = {};
+    }
+
+    // 第 2 步：然后设置认证头（直接赋值）
+    if (monitor.authMethod === "basic") {
+        // 直接赋值，会覆盖已有的值
+        options.headers.Authorization = `Basic ${credentials}`;
+    } else if (monitor.authMethod === "oauth2-cc") {
+        // 直接赋值，会覆盖已有的值
+        options.headers.Authorization = `${monitor.oauthAccessToken.token_type} ${...}`;
+    }
+    // ...
+}
+```
+
+#### 测试用例验证（已存在的测试）
+
+**测试位置**：`test/backend-test/monitors/test-websocket.js:408-425`
+
+```javascript
+test("buildWsOptions() authentication header overrides custom Authorization header", async () => {
+    const options = await websocketMonitor.buildWsOptions({
+        // 自定义 headers 包含 Authorization
+        headers: JSON.stringify({
+            Authorization: "Bearer custom-token",
+            "X-Test": "test-value",
+        }),
+        authMethod: "basic",
+        basic_auth_user: "user",
+        basic_auth_pass: "pass",
+    });
+
+    // 验证：Basic auth 覆盖了自定义的 Authorization
+    assert.deepStrictEqual(options.headers, {
+        Authorization: "Basic dXNlcjpwYXNz",  // 被 Basic Auth 覆盖！
+        "X-Test": "test-value",                // 其他自定义 header 保留
+    });
+});
+```
+
+#### WebSocket 监控的覆盖判定表
+
+| 场景 | authMethod | 自定义 headers | 代码执行顺序 | 结果 `headers.Authorization` | 说明 |
+|------|------------|----------------|-------------|------------------------------|------|
+| 场景 A | `basic` | `{}` 或无 | 1 → 2 | `"Basic xxx"` | 正常 |
+| 场景 B | `basic` | `{"Authorization": "Custom"}` | 1 → 2 | `"Basic xxx"` | **Basic Auth 覆盖自定义** |
+| 场景 C | `oauth2-cc` | `{"Authorization": "Old"}` | 1 → 2 | `"Bearer ..."` | **OAuth2 覆盖自定义** |
+| 场景 D | `basic` | `{"authorization": "lowercase"}` | 1 → 2 | `"Basic xxx"` | 直接赋值 `Authorization`，小写 key 保留但不影响 |
+
+---
+
+### 三、两种监控类型的优先级对比
+
+| 维度 | HTTP 监控 | WebSocket 监控 |
+|------|----------|----------------|
+| **代码模式** | 对象展开运算符 `{...a, ...b}` | 先解析，后直接赋值 `obj.key = value` |
+| **自定义 headers 位置** | 最后展开 | 最先解析 |
+| **认证头位置** | 中间展开 | 最后赋值 |
+| **优先级结果** | 自定义 headers > 认证头 | 认证头 > 自定义 headers |
+| **测试覆盖** | 无针对性测试 | 有明确测试验证（`test-websocket.js:408`） |
+
+---
+
+### 四、风险与建议
+
+#### 针对 HTTP 监控的风险
+
+**风险描述**：
+- 如果用户在配置 Basic Auth 或 OAuth2 的同时，在自定义 headers 中包含了 `Authorization` 字段（首字母大写），**自定义的值会静默覆盖自动生成的认证头**
+- 这会导致认证失败，且没有任何错误提示
+
+**可复核的触发条件**：
+1. 监控类型为 HTTP（或 keyword、json-query）
+2. `auth_method` 设置为 `basic` 或 `oauth2-cc`
+3. 自定义 headers JSON 中包含 `"Authorization": "..."`（注意是首字母大写 `A`）
+
+**建议**：
+1. 当使用 Basic Auth 或 OAuth2 认证时，**不要**在自定义 headers 中配置 `Authorization` 字段
+2. 如果认证失败且配置了自定义 headers，检查是否包含 `Authorization` 字段
+3. 如需添加额外的认证相关 headers，使用不同的 key 名（如 `X-Api-Key`）
+
+#### 针对 WebSocket 监控的风险
+
+**风险描述**：
+- WebSocket 监控中认证头会覆盖自定义 headers，这是**预期行为**（有测试验证）
+- 如果用户想在自定义 headers 中配置 `Authorization`，需要确保没有设置 `authMethod`
+
+**建议**：
+1. WebSocket 监控的行为符合预期，认证头优先级更高
+2. 如果需要完全自定义 `Authorization`，将 `authMethod` 设置为无（或不配置）
+
+---
+
+### 五、关于大小写的补充说明
+
+**JavaScript 层面**：
+- `Authorization`、`authorization`、`AUTHORIZATION` 是三个不同的属性名
+- 只有完全相同的字符串才会发生覆盖
+
+**HTTP 传输层面**：
+- HTTP/1.1 规范规定 headers 名称是大小写不敏感的
+- 但实际行为取决于服务器实现
+
+**axios 层面**：
+- axios 会对某些常见 headers 进行规范化（如 `content-type` → `Content-Type`）
+- 但 `Authorization` 头通常不会被规范化
+
+**结论**：
+- 为确保行为可预测，**统一使用首字母大写的 `Authorization`**
+- 避免依赖大小写差异来区分不同的认证头
 
 #### Content-Type 判定逻辑
 
