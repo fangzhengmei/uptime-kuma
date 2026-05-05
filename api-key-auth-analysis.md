@@ -187,15 +187,37 @@ let clear = key.substring(key.indexOf("_") + 1, key.length);  // 即 key.substri
 - **令牌扣减**: 会扣减
 
 #### 场景 3：前缀异常（不是 `uk` 开头）
-- **触发条件**: key 前缀不是 `uk`，如 `xx1_abcdef`
+
+**⚠️ 重要边界条件：代码从不验证 `uk` 前缀！**
+
+- **触发条件**: key 前缀不是 `uk`，如 `xx1_abcdef...`
 - **解析结果**:
   - `index = key.substring(2, key.indexOf("_"))` 提取从第 3 个字符到 `_` 的部分
-  - 例如 `xx1_abcdef` → `index = "1"`, `clear = "abcdef"`
-- **数据库查询**: `R.findOne("api_key", " id=? ", ["1"])`
-- **返回值**: 
+  - `clear = key.substring(key.indexOf("_") + 1, key.length)` 提取 `_` 之后的部分
+  - **前两个字符完全没有被检查**
+- **边界条件分析**:
+
+  | 示例 Key | 解析结果 | 能否通过验证 |
+  |----------|----------|--------------|
+  | `uk1_abcdef...` (正确格式) | `index="1"`, `clear="abcdef..."` | 取决于 bcrypt 验证 |
+  | `xx1_abcdef...` (前缀异常) | `index="1"`, `clear="abcdef..."` | **与正确格式相同！** |
+  | `ab123_xyz...` (前缀异常) | `index="123"`, `clear="xyz..."` | 取决于 ID=123 的记录 |
+
+- **通过验证的条件**（前缀异常但仍可能通过）：
+  1. `key.substring(2, key.indexOf("_"))` 提取的 ID **存在于数据库**
+  2. `key.substring(key.indexOf("_") + 1, key.length)` 提取的密钥部分 **与该 ID 的 bcrypt 哈希匹配**
+  3. 该 Key 记录的 `active=1` 且 `expires` 未过期
+
+- **实际影响**:
+  - 如果正确的 Key 是 `uk1_aB3cD5eF7gH9iJ1kL2mN3oP4qR6sT8uV0wX2yZ4`
+  - 那么 `xx1_aB3cD5eF7gH9iJ1kL2mN3oP4qR6sT8uV0wX2yZ4` 也**完全等效**，能够通过验证
+  - 前两个字符可以是**任意值**，不影响验证结果
+
+- **返回值**:
   - 如果 ID 不存在 → `false`
-  - 如果 ID 存在 → `passwordHash.verify("abcdef", hash.key)` 几乎肯定失败 → `false`
-- **令牌扣减**: 会扣减
+  - 如果 ID 存在但密钥不匹配 → `false`
+  - ⚠️ **如果 ID 存在且密钥匹配 → `true`（验证通过！）**
+- **令牌扣减**: 会扣减（无论验证成功还是失败）
 
 #### 场景 4：ID 不存在
 ```javascript
