@@ -340,9 +340,9 @@ methods: {
 
 ---
 
-## 二、认证机制详解
+## 三、认证机制详解
 
-### 2.1 Socket.io 认证机制（管理后台）
+### 3.1 Socket.io 认证机制（管理后台）
 
 文件位置: `server/server.js`
 
@@ -475,7 +475,7 @@ exports.apiAuth = async function (req, res, next) {
 };
 ```
 
-### 2.3 API Key 验证机制
+### 3.3 API Key 验证机制
 
 文件位置: `server/auth.js`
 
