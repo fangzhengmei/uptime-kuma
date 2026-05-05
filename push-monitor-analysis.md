@@ -576,6 +576,417 @@ computed: {
 | 前端编辑页 | 令牌重置 | `src/pages/EditMonitor.vue` | 4006-4008 |
 | 前端详情页 | pushURL 计算属性 | `src/pages/Details.vue` | 583-585 |
 
+### 2.6 Push Token 可见性边界
+
+Uptime Kuma 通过 `toJSON()` 方法的 `includeSensitiveData` 参数和 `toPublicJSON()` 方法来控制 Push Token 等敏感数据的可见性边界。
+
+#### 2.6.1 核心控制机制
+
+**`toJSON()` 方法的 `includeSensitiveData` 参数：**
+
+**文件位置：** `server/model/monitor.js:117, 218-250`
+
+```javascript
+// toJSON() 方法签名
+toJSON(preloadData = {}, includeSensitiveData = true) {
+    // ... 基础数据字段（不包含敏感数据）...
+    
+    if (includeSensitiveData) {
+        // 仅当 includeSensitiveData = true 时才包含这些字段
+        data = {
+            ...data,
+            // 认证凭据
+            headers: this.headers,
+            body: this.body,
+            basic_auth_user: this.basic_auth_user,
+            basic_auth_pass: this.basic_auth_pass,
+            // OAuth 凭据
+            oauth_client_id: this.oauth_client_id,
+            oauth_client_secret: this.oauth_client_secret,
+            oauth_token_url: this.oauth_token_url,
+            oauth_scopes: this.oauth_scopes,
+            // Push Token（敏感！）
+            pushToken: this.pushToken,           // ← 关键字段
+            // 数据库连接字符串
+            databaseConnectionString: this.databaseConnectionString,
+            // Radius 凭据
+            radiusUsername: this.radiusUsername,
+            radiusPassword: this.radiusPassword,
+            radiusSecret: this.radiusSecret,
+            // MQTT 凭据
+            mqttUsername: this.mqttUsername,
+            mqttPassword: this.mqttPassword,
+            // TLS 证书密钥
+            tlsCa: this.tlsCa,
+            tlsCert: this.tlsCert,
+            tlsKey: this.tlsKey,
+            // Kafka SASL 选项
+            kafkaProducerSaslOptions: JSON.parse(this.kafkaProducerSaslOptions),
+            // RabbitMQ 凭据
+            rabbitmqUsername: this.rabbitmqUsername,
+            rabbitmqPassword: this.rabbitmqPassword,
+        };
+    }
+    
+    data.includeSensitiveData = includeSensitiveData;  // 标记数据来源
+    return data;
+}
+```
+
+**`toPublicJSON()` 方法（用于公共访问）：**
+
+**文件位置：** `server/model/monitor.js:85-108`
+
+```javascript
+// toPublicJSON() 只返回最小必要的公开数据
+async toPublicJSON(showTags = false, certExpiry = false) {
+    let obj = {
+        id: this.id,
+        name: this.name,
+        sendUrl: this.sendUrl,
+        type: this.type,
+    };
+
+    if (this.sendUrl) {
+        obj.url = this.customUrl ?? this.url;
+    }
+
+    // 可选的扩展字段，仍不包含敏感数据
+    if (showTags) {
+        obj.tags = await this.getTags();
+    }
+
+    if (certExpiry) {
+        const { certExpiryDaysRemaining, validCert } = await this.getCertExpiry(this.id);
+        obj.certExpiryDaysRemaining = certExpiryDaysRemaining;
+        obj.validCert = validCert;
+    }
+
+    return obj;  // 绝对不包含 pushToken
+}
+```
+
+#### 2.6.2 包含 Push Token 的链路（Owner 可见的管理链路）
+
+以下链路中 `includeSensitiveData = true`（默认值），**Push Token 会被带出**：
+
+| 链路类型 | 调用方式 | 文件位置 | 说明 |
+|----------|----------|----------|------|
+| **监控列表 Socket 事件** | `monitor.toJSON(preloadData)` | `server/uptime-kuma-server.js:275` | 登录用户接收 `monitorList` 事件 |
+| **监控更新 Socket 事件** | `monitor.toJSON(preloadData)` | `server/uptime-kuma-server.js:275` | 登录用户接收 `updateMonitorIntoList` 事件 |
+| **编辑页获取单条监控** | `monitor.toJSON(preloadData)` | `server/server.js:998` | `getMonitor` Socket 事件响应 |
+
+**详细代码分析：**
+
+**1. 监控列表获取（所有登录用户可见）：**
+
+**文件位置：** `server/uptime-kuma-server.js:256-277`
+
+```javascript
+async getMonitorJSONList(userID, monitorID = null) {
+    // ... 数据库查询 ...
+    let monitorList = await R.find("monitor", query + "ORDER BY weight DESC, name", queryParams);
+    
+    // ... 预处理数据 ...
+    const preloadData = await Monitor.preparePreloadData(monitorData);
+    
+    // 关键：调用 toJSON() 时未传入第二个参数，使用默认值 includeSensitiveData = true
+    const result = {};
+    monitorList.forEach((monitor) => (result[monitor.id] = monitor.toJSON(preloadData)));
+    // result 中的每个 monitor 都包含 pushToken
+    return result;
+}
+```
+
+**触发的 Socket 事件：**
+- `io.to(userID).emit("monitorList", list)` → 完整列表推送
+- `io.to(userID).emit("updateMonitorIntoList", list)` → 增量更新
+
+**2. 编辑页获取单条监控：**
+
+**文件位置：** `server/server.js:987-1000`
+
+```javascript
+socket.on("getMonitor", async (monitorID, callback) => {
+    try {
+        checkLogin(socket);  // 验证已登录
+        
+        let monitor = await R.findOne("monitor", " id = ? AND user_id = ? ", [monitorID, socket.userID]);
+        const monitorData = [{ id: monitor.id, active: monitor.active }];
+        const preloadData = await Monitor.preparePreloadData(monitorData);
+        
+        // 关键：toJSON() 使用默认的 includeSensitiveData = true
+        callback({
+            ok: true,
+            monitor: monitor.toJSON(preloadData),  // 包含 pushToken
+        });
+    } catch (e) {
+        // ... 错误处理
+    }
+});
+```
+
+#### 2.6.3 不包含 Push Token 的链路（通知和非管理链路）
+
+以下链路中 **Push Token 会被过滤掉**：
+
+| 链路类型 | 调用方式 | 过滤机制 | 文件位置 |
+|----------|----------|----------|----------|
+| **所有通知发送** | `monitor.toJSON(preloadData, false)` | `includeSensitiveData = false` | `server/model/monitor.js:1544` |
+| **公共状态页 Heartbeat API** | `heartbeat.toPublicJSON()` | `toPublicJSON()` 方法 | `server/routers/status-page-router.js:97` |
+| **公共状态页 Incident API** | `incident.toPublicJSON()` | `toPublicJSON()` 方法 | `server/socket-handlers/status-page-socket-handler.js:74, 176, 257` |
+| **公共状态页 Config** | `statusPage.toPublicJSON()` | `toPublicJSON()` 方法 | `server/model/status_page.js:268` |
+
+**详细代码分析：**
+
+**1. 通知发送（关键安全边界）：**
+
+**文件位置：** `server/model/monitor.js:1486-1552`
+
+```javascript
+static async sendNotification(isFirstBeat, monitor, bean) {
+    if (!isFirstBeat || bean.status === DOWN) {
+        const notificationList = await Monitor.getNotificationList(monitor);
+
+        // 构建通知消息
+        let text;
+        if (bean.status === UP) {
+            text = "✅ Up";
+        } else {
+            text = "🔴 Down";
+        }
+        let msg = `[${monitor.name}] [${text}] ${bean.msg}`;
+
+        // ... 构建 heartbeatJSON ...
+
+        const monitorData = [{ id: monitor.id, active: monitor.active, name: monitor.name }];
+        const preloadData = await Monitor.preparePreloadData(monitorData);
+
+        // 遍历所有通知提供者（Webhook、Email、Telegram、Slack 等）
+        for (let notification of notificationList) {
+            try {
+                await Notification.send(
+                    JSON.parse(notification.config),
+                    msg,
+                    // 关键！显式传入 includeSensitiveData = false
+                    monitor.toJSON(preloadData, false),  // ← 不包含 pushToken！
+                    heartbeatJSON
+                );
+            } catch (e) {
+                log.error("monitor", "Cannot send notification to " + notification.name);
+                log.error("monitor", e);
+            }
+        }
+    }
+}
+```
+
+**影响范围：**
+- **Webhook 通知**：请求体中 `monitorJSON` 不包含 `pushToken`
+- **Email 通知**：模板变量中不包含 `pushToken`
+- **Telegram/Discord/Slack 等聊天通知**：消息中不包含 `pushToken`
+- **所有其他通知提供者**：都无法获取 `pushToken`
+
+**2. 公共状态页 API：**
+
+**文件位置：** `server/routers/status-page-router.js:64-110`
+
+```javascript
+// 公共状态页心跳数据 API（无需登录）
+router.get("/api/status-page/heartbeat/:slug", cache("1 minutes"), async (request, response) => {
+    // ... 查询公开的监控组 ...
+    
+    let monitorIDList = await R.getCol(
+        `
+        SELECT monitor_group.monitor_id FROM monitor_group, \`group\`
+        WHERE monitor_group.group_id = \`group\`.id
+        AND public = 1    -- 仅公开的分组
+        AND \`group\`.status_page_id = ?
+    `,
+        [statusPageID]
+    );
+
+    for (let monitorID of monitorIDList) {
+        let list = await R.getAll(
+            `SELECT * FROM heartbeat WHERE monitor_id = ? ORDER BY time DESC LIMIT 100`,
+            [monitorID]
+        );
+
+        list = R.convertToBeans("heartbeat", list);
+        // 关键：使用 toPublicJSON()，不包含敏感数据
+        heartbeatList[monitorID] = list.reverse().map((row) => row.toPublicJSON());
+    }
+
+    response.json({
+        heartbeatList,  // 所有心跳数据都已过滤
+        uptimeList,
+    });
+});
+```
+
+**3. 公共状态页事件处理：**
+
+**文件位置：** `server/socket-handlers/status-page-socket-handler.js:64-82`
+
+```javascript
+// 保存事件后返回公共数据
+await R.store(incidentBean);
+
+callback({
+    ok: true,
+    incident: incidentBean.toPublicJSON(),  // 不包含敏感数据
+});
+```
+
+#### 2.6.4 可见性边界总览表
+
+| 访问场景 | 身份认证 | Push Token 可见 | 数据序列化方式 |
+|----------|----------|-----------------|----------------|
+| **管理后台（仪表板）** | 已登录 Owner | ✅ 可见 | `toJSON(preloadData)` 包含敏感数据 |
+| **编辑页面** | 已登录 Owner | ✅ 可见 | `toJSON(preloadData)` 包含敏感数据 |
+| **详情页面** | 已登录 Owner | ✅ 可见 | 从 `$root.monitorList` 获取（已包含） |
+| **所有通知（Webhook/Email/Telegram 等）** | 通知接收者 | ❌ **不可见** | `toJSON(preloadData, false)` 过滤敏感数据 |
+| **公共状态页** | 匿名访问者 | ❌ **不可见** | `toPublicJSON()` 最小化数据 |
+| **公共状态页 RSS** | 匿名访问者 | ❌ **不可见** | `toPublicJSON()` 最小化数据 |
+| **状态页徽章 API** | 匿名访问者 | ❌ **不可见** | 直接查询状态值，不暴露监控详情 |
+| **外部心跳 API** | 外部系统 | 需**携带** token 才能调用 | 反向：外部系统**必须知道** token 才能发送心跳 |
+
+#### 2.6.5 安全边界流程图
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              Push Token 安全边界架构                                              │
+├──────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                  │
+│  ┌──────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │                              安全边界之内（Owner 可见）                                     ││
+│  │                                                                                              ││
+│  │   ┌────────────────────────────────────────────────────────────────────────────────────┐  ││
+│  │   │                         后端 API 层（已登录用户）                                    │  ││
+│  │   │                                                                                        │  ││
+│  │   │  Socket 事件:                                                                          │  ││
+│  │   │  ┌──────────────────┐     ┌────────────────────────────┐                            │  ││
+│  │   │  │   monitorList    │     │   updateMonitorIntoList    │                            │  ││
+│  │   │  │   (完整列表)      │     │   (增量更新)                │                            │  ││
+│  │   │  │                  │     │                            │                            │  ││
+│  │   │  │ toJSON(preloadData) │  │ toJSON(preloadData)     │                            │  ││
+│  │   │  │ includeSensitiveData=true │ includeSensitiveData=true │                         │  ││
+│  │   │  │                  │     │                            │                            │  ││
+│  │   │  │ ✅ 包含 pushToken │     │ ✅ 包含 pushToken         │                            │  ││
+│  │   │  └────────┬─────────┘     └─────────────┬──────────────┘                            │  ││
+│  │   │           │                               │                                           │  ││
+│  │   │           └───────────────┬───────────────┘                                           │  ││
+│  │   │                           │                                                           │  ││
+│  │   │                           ▼                                                           │  ││
+│  │   │              ┌────────────────────────────┐                                            │  ││
+│  │   │              │   前端: $root.monitorList │                                            │  ││
+│  │   │              │   (Vue 响应式数据)         │                                            │  ││
+│  │   │              │   ✅ 包含 pushToken        │                                            │  ││
+│  │   │              └─────────────┬──────────────┘                                            │  ││
+│  │   │                            │                                                            │  ││
+│  │   │            ┌───────────────┼───────────────┐                                            │  ││
+│  │   │            │               │               │                                            │  ││
+│  │   │            ▼               ▼               ▼                                            │  ││
+│  │   │   ┌──────────────┐ ┌──────────────┐ ┌──────────────┐                                  │  ││
+│  │   │   │ 仪表板页面    │ │ 编辑页面      │ │ 详情页面      │                                  │  ││
+│  │   │   │ Dashboard     │ │ EditMonitor  │ │ Details      │                                  │  ││
+│  │   │   │              │ │              │ │              │                                  │  ││
+│  │   │   │ 显示状态列表  │ │ 显示 Push URL│ │ 显示 Push URL│                                  │  ││
+│  │   │   │ ✅ 可用于查看 │ │ ✅ 可编辑令牌 │ │ ✅ 可复制 URL │                                  │  ││
+│  │   │   └──────────────┘ └──────────────┘ └──────────────┘                                  │  ││
+│  │   │                                                                                        │  ││
+│  │   └────────────────────────────────────────────────────────────────────────────────────┘  ││
+│  └──────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                              │                                                   │
+│                                              │ 安全边界                                          │
+│                                              ▼                                                   │
+│  ┌──────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │                            安全边界之外（敏感数据被过滤）                                   ││
+│  │                                                                                              ││
+│  │   ┌────────────────────────────────────────────────────────────────────────────────────┐  ││
+│  │   │                              通知系统                                                  │  ││
+│  │   │                                                                                        │  ││
+│  │   │   sendNotification() 调用:                                                            │  ││
+│  │   │   monitor.toJSON(preloadData, false)  ← includeSensitiveData = false                 │  ││
+│  │   │                                                                                        │  ││
+│  │   │   ❌ 不包含 pushToken, headers, body, basic_auth_pass 等敏感字段                      │  ││
+│  │   │                                                                                        │  ││
+│  │   │   影响范围:                                                                             │  ││
+│  │   │   ┌─────────────┬─────────────┬─────────────┬──────────────────┐                    │  ││
+│  │   │   │  Webhook    │   Email     │  Telegram   │ Slack/Discord    │                    │  ││
+│  │   │   │             │             │             │ Teams/...         │                    │  ││
+│  │   │   │ ❌ 无 token │ ❌ 无 token │ ❌ 无 token │ ❌ 无 token      │                    │  ││
+│  │   │   └─────────────┴─────────────┴─────────────┴──────────────────┘                    │  ││
+│  │   │                                                                                        │  ││
+│  │   └────────────────────────────────────────────────────────────────────────────────────┘  ││
+│  │                                                                                              ││
+│  │   ┌────────────────────────────────────────────────────────────────────────────────────┐  ││
+│  │   │                            公共状态页（匿名访问）                                      │  ││
+│  │   │                                                                                        │  ││
+│  │   │   使用 toPublicJSON() 方法:                                                            │  ││
+│  │   │   ┌─────────────────────┐                                                              │  ││
+│  │   │   │  id, name, type,    │ ← 仅返回最小必要字段                                        │  ││
+│  │   │   │  url (可选)          │                                                              │  ││
+│  │   │   │  tags (可选)         │                                                              │  ││
+│  │   │   │  certExpiry (可选)  │                                                              │  ││
+│  │   │   └─────────────────────┘                                                              │  ││
+│  │   │                                                                                        │  ││
+│  │   │   API 端点（无需认证）:                                                                 │  ││
+│  │   │   ┌──────────────────────────────┐ ┌──────────────────────────────┐                    │  ││
+│  │   │   │ /api/status-page/:slug        │ │ /api/status-page/:slug/badge │                    │  ││
+│  │   │   │ /api/status-page/:slug/rss    │ │ /api/status-page/heartbeat/  │                    │  ││
+│  │   │   │ /api/status-page/heartbeat/   │ │ /api/status-page/:slug/      │                    │  ││
+│  │   │   │ :slug                          │ │ incident-history             │                    │  ││
+│  │   │   │                              │ │                              │                    │  ││
+│  │   │   │ ❌ 所有监控详情均过滤敏感数据  │ │ ❌ 仅返回状态值             │                    │  ││
+│  │   │   └──────────────────────────────┘ └──────────────────────────────┘                    │  ││
+│  │   │                                                                                        │  ││
+│  │   └────────────────────────────────────────────────────────────────────────────────────┘  ││
+│  └──────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                  │
+│  ┌──────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │                          特殊：外部心跳 API（反向访问）                                      ││
+│  │                                                                                              ││
+│  │   端点: POST /api/push/:pushToken                                                          ││
+│  │                                                                                              ││
+│  │   ┌────────────────────────────────────────────────────────────────────────────────────┐  ││
+│  │   │  外部系统必须**预先知道** pushToken 才能调用此 API                                     │  ││
+│  │   │                                                                                        │  ││
+│  │   │  流程:                                                                                 │  ││
+│  │   │  1. Owner 在管理后台查看/复制 Push URL（包含 token）                                   │  ││
+│  │   │  2. Owner 将 token 配置到外部 cron/脚本中                                             │  ││
+│  │   │  3. 外部系统携带 token 调用 /api/push/:token                                          │  ││
+│  │   │  4. 后端验证 token 对应的 monitor 并处理心跳                                          │  ││
+│  │   │                                                                                        │  ││
+│  │   │  关键点: token 由 Owner 主动分发到外部系统，而非 API 暴露                              │  ││
+│  │   └────────────────────────────────────────────────────────────────────────────────────┘  ││
+│  └──────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 2.6.6 关键安全设计总结
+
+| 设计原则 | 实现方式 | 安全意义 |
+|----------|----------|----------|
+| **最小权限原则** | `toPublicJSON()` 只返回必要字段 | 公共 API 不会意外泄露敏感数据 |
+| **显式控制** | `includeSensitiveData` 默认为 `true` 但通知时显式传 `false` | 防止在通知、Webhook 等扩展点泄露 |
+| **数据来源标记** | `data.includeSensitiveData = includeSensitiveData` | 前端可判断数据是否包含敏感信息，克隆时清除 |
+| **令牌分发可控** | token 仅在管理界面显示，需 Owner 主动复制 | 外部系统无法通过 API 主动获取 token |
+
+#### 2.6.7 相关代码位置汇总（可见性边界）
+
+| 功能 | 文件路径 | 关键行号 |
+|------|----------|----------|
+| `toJSON()` 方法定义 | `server/model/monitor.js` | 117, 218-250 |
+| `toPublicJSON()` 方法定义 | `server/model/monitor.js` | 85-108 |
+| 通知发送时过滤敏感数据 | `server/model/monitor.js` | 1544 |
+| 监控列表获取（包含敏感数据） | `server/uptime-kuma-server.js` | 275 |
+| 编辑页获取单条监控（包含敏感数据） | `server/server.js` | 998 |
+| 公共状态页心跳 API（过滤） | `server/routers/status-page-router.js` | 97 |
+| 公共状态页事件处理（过滤） | `server/socket-handlers/status-page-socket-handler.js` | 74, 176, 257 |
+| 前端克隆时清除敏感数据标记 | `src/pages/EditMonitor.vue` | 3805 |
+
 ## 三、外部心跳接入链路
 
 ### 3.1 API 端点
