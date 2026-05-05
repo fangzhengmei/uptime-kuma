@@ -139,6 +139,207 @@ const routes = [
 
 ---
 
+## 二、状态页与管理后台的前后端分流机制
+
+### 2.1 为什么状态页不会走进登录后台链路
+
+Uptime Kuma 采用了**多层分离机制**，确保状态页访问不会触发管理后台的认证链路。
+
+#### 第一层：前端 Socket.io 连接排除机制
+
+文件位置: `src/mixins/socket.js:19-98`
+
+```javascript
+// 明确排除状态页路径，不建立 Socket.io 连接
+const noSocketIOPages = [
+    /^\/status-page$/, //  /status-page
+    /^\/status/,       // /status**
+    /^\/$/,            //  /
+];
+
+methods: {
+    initSocketIO(bypass = false) {
+        // 已初始化则跳过
+        if (this.socket.initedSocketIO) {
+            return;
+        }
+
+        // 关键：状态页路径不建立 Socket.io 连接
+        if (!bypass && location.pathname) {
+            for (let page of noSocketIOPages) {
+                if (location.pathname.match(page)) {
+                    return;  // 直接返回，不建立连接
+                }
+            }
+        }
+
+        // 也不需要为数据库设置页面建立连接
+        if (location.pathname === "/setup-database") {
+            return;
+        }
+
+        // 只有管理后台页面才会执行到这里，建立 Socket.io 连接
+        this.socket.initedSocketIO = true;
+        socket = io(url);
+        // ... 后续 Socket.io 事件监听
+    },
+}
+```
+
+**工作原理**：
+1. `noSocketIOPages` 数组定义了需要排除的路径模式
+2. `initSocketIO()` 函数在组件创建时被调用
+3. 如果当前路径匹配状态页模式，函数直接 `return`，**不会建立 Socket.io 连接**
+4. 没有 Socket.io 连接，就不会触发后续的 `loginRequired` 事件和登录流程
+
+#### 第二层：路由切换时的动态连接控制
+
+文件位置: `src/mixins/socket.js:877-893`
+
+```javascript
+watch: {
+    // 从状态页切换到管理后台时，动态建立 Socket.io 连接
+    "$route.fullPath"(newValue, oldValue) {
+        if (newValue) {
+            for (let page of noSocketIOPages) {
+                if (newValue.match(page)) {
+                    return;  // 状态页路径，不建立连接
+                }
+            }
+        }
+
+        // 非状态页路径，确保 Socket.io 已初始化
+        this.initSocketIO();
+    },
+},
+```
+
+#### 第三层：状态页数据获取方式（HTTP API，非 Socket.io）
+
+文件位置: `src/pages/StatusPage.vue`
+
+状态页组件不依赖 Socket.io 获取数据，而是通过**公开的 HTTP API**：
+
+```javascript
+// 状态页使用 axios 调用公开 API，不使用 Socket.io
+created() {
+    // 前端本地检查是否有 token（仅用于显示编辑按钮）
+    this.hasToken = "token" in this.$root.storage();
+    
+    // 数据通过公开 HTTP API 获取
+    this.loadData();
+},
+
+methods: {
+    async loadData() {
+        // 调用公开的状态页 API，无认证要求
+        const res = await axios.get(`/api/status-page/${this.slug}`);
+        this.config = res.data.config;
+        // ...
+    },
+    
+    // 编辑模式才需要 Socket.io
+    edit() {
+        if (this.hasToken) {
+            // 强制建立 Socket.io 连接（bypass=true）
+            this.$root.initSocketIO(true);
+            this.enableEditMode = true;
+            // ...
+        }
+    },
+}
+```
+
+**关键区别**：
+
+| 场景 | 数据获取方式 | 是否建立 Socket.io | 是否触发认证 |
+|-----|------------|-------------------|-------------|
+| **状态页浏览** | HTTP API (`/api/status-page/*`) | ❌ 否 | ❌ 否 |
+| **状态页编辑模式** | Socket.io | ✅ 是（`bypass=true`） | ✅ 是 |
+| **管理后台** | Socket.io | ✅ 是 | ✅ 是 |
+
+#### 第四层：后端状态页路由无认证中间件
+
+文件位置: `server/routers/status-page-router.js`
+
+```javascript
+let router = express.Router();
+
+// 状态页路由 - 完全没有认证中间件
+router.get("/status/:slug", cache("5 minutes"), async (request, response) => {
+    let slug = request.params.slug;
+    slug = slug.toLowerCase();
+    await StatusPage.handleStatusPageResponse(response, server.indexHTML, slug);
+});
+
+// 状态页 API - 也没有认证中间件
+router.get("/api/status-page/:slug", cache("5 minutes"), async (request, response) => {
+    allowDevAllOrigin(response);
+    let slug = request.params.slug;
+    slug = slug.toLowerCase();
+
+    try {
+        let statusPage = await R.findOne("status_page", " slug = ? ", [slug]);
+        // ... 直接返回数据，无认证检查
+    } catch (error) {
+        sendHttpError(response, error.message);
+    }
+});
+
+module.exports = router;
+```
+
+对比管理操作的认证要求（`server/server.js`）：
+
+```javascript
+// 管理操作必须通过 checkLogin 检查
+socket.on("add", async (monitor, callback) => {
+    try {
+        checkLogin(socket);  // 强制认证
+        // ... 后续操作
+    } catch (e) {
+        callback({ ok: false, msg: e.message });
+    }
+});
+```
+
+### 2.2 前端 `hasToken` 的作用与局限
+
+文件位置: `src/pages/StatusPage.vue:690, 964, 1133-1142`
+
+```javascript
+data() {
+    return {
+        hasToken: false,  // 只是前端状态，不影响后端认证
+        // ...
+    };
+},
+
+async created() {
+    // 前端本地检查 localStorage/sessionStorage 中是否有 token
+    this.hasToken = "token" in this.$root.storage();
+    // 注意：这只是前端判断，不影响后端认证逻辑
+},
+
+methods: {
+    edit() {
+        if (this.hasToken) {
+            // 只有前端判断有 token 时才尝试进入编辑模式
+            this.$root.initSocketIO(true);  // 强制建立 Socket.io 连接
+            this.enableEditMode = true;
+            // 但真正的认证还是在后端进行
+        }
+    },
+},
+```
+
+**关键理解**：
+- `hasToken` 只是**前端本地状态**，用于控制 UI 显示（如编辑按钮）
+- 即使前端绕过这个检查，后端 `checkLogin` 仍然会验证 `socket.userID`
+- 真正的认证发生在后端的 `loginByToken` 和 `checkLogin` 环节
+
+---
+
 ## 二、认证机制详解
 
 ### 2.1 Socket.io 认证机制（管理后台）
