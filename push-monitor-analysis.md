@@ -67,6 +67,515 @@ if (this.isClone) {
 }
 ```
 
+### 2.5 令牌数据绑定链路（数据库 → 前端页面）
+
+Push Token 从数据库记录到前端编辑页和详情页的完整数据流转链路涉及多个层次：
+
+#### 2.5.1 数据层：数据库字段映射
+
+数据库中存储的字段名为 `push_token`（snake_case），在后端模型中转换为 `pushToken`（camelCase）：
+
+**文件位置：** `server/model/monitor.js:233`
+
+```javascript
+// 在 toJSON() 方法中，pushToken 被包含在敏感数据中返回
+if (includeSensitiveData) {
+    data = {
+        ...data,
+        // ... 其他字段
+        pushToken: this.pushToken,  // 数据库字段是 push_token，通过 ORM 映射
+        // ... 其他字段
+    };
+}
+```
+
+**关键机制：**
+- 使用 RedBean ORM，数据库字段 `push_token` 自动映射到 bean 属性 `pushToken`
+- `toJSON()` 方法默认包含敏感数据（`includeSensitiveData = true`），所以 pushToken 会被返回
+
+#### 2.5.2 后端：监控列表获取
+
+后端通过 `sendMonitorList` 和 `sendUpdateMonitorIntoList` 方法将监控数据发送到前端：
+
+**文件位置：** `server/uptime-kuma-server.js:219-234, 256-277`
+
+```javascript
+// 发送完整监控列表
+async sendMonitorList(socket) {
+    let list = await this.getMonitorJSONList(socket.userID);
+    this.io.to(socket.userID).emit("monitorList", list);  // 发送 monitorList 事件
+    return list;
+}
+
+// 发送更新的单个监控到列表
+async sendUpdateMonitorIntoList(socket, monitorID) {
+    let list = await this.getMonitorJSONList(socket.userID, monitorID);
+    if (list && list[monitorID]) {
+        this.io.to(socket.userID).emit("updateMonitorIntoList", list);
+    }
+}
+
+// 构建监控数据列表
+async getMonitorJSONList(userID, monitorID = null) {
+    // ... 查询数据库 ...
+    let monitorList = await R.find("monitor", query + "ORDER BY weight DESC, name", queryParams);
+    
+    // ... 预处理数据 ...
+    const preloadData = await Monitor.preparePreloadData(monitorData);
+    
+    // 调用 toJSON() 转换，包含 pushToken
+    const result = {};
+    monitorList.forEach((monitor) => (result[monitor.id] = monitor.toJSON(preloadData)));
+    return result;
+}
+```
+
+#### 2.5.3 后端：单个监控获取（编辑页使用）
+
+当用户进入编辑页面时，前端通过 `getMonitor` 事件获取单个监控的详细数据：
+
+**文件位置：** `server/server.js:987-1000`
+
+```javascript
+socket.on("getMonitor", async (monitorID, callback) => {
+    try {
+        checkLogin(socket);
+
+        log.info("monitor", `Get Monitor: ${monitorID} User ID: ${socket.userID}`);
+
+        // 从数据库查询监控
+        let monitor = await R.findOne("monitor", " id = ? AND user_id = ? ", [monitorID, socket.userID]);
+        const monitorData = [{ id: monitor.id, active: monitor.active }];
+        const preloadData = await Monitor.preparePreloadData(monitorData);
+        
+        // 调用 toJSON()，包含 pushToken（因为 includeSensitiveData 默认为 true）
+        callback({
+            ok: true,
+            monitor: monitor.toJSON(preloadData),
+        });
+        // ...
+    } catch (e) {
+        // ... 错误处理
+    }
+});
+```
+
+#### 2.5.4 后端：保存监控时的令牌处理
+
+当用户保存编辑后的监控时，`editMonitor` 事件处理函数将 `pushToken` 保存回数据库：
+
+**文件位置：** `server/server.js:800-881, 940-954`
+
+```javascript
+socket.on("editMonitor", async (monitor, callback) => {
+    try {
+        // ... 权限检查 ...
+        
+        let bean = await R.findOne("monitor", " id = ? ", [monitor.id]);
+        
+        // ... 其他字段赋值 ...
+        
+        // pushToken 从前端 monitor 对象赋值到数据库 bean
+        bean.pushToken = monitor.pushToken;  // 关键绑定！
+        
+        // ... 其他字段赋值 ...
+        
+        bean.validate();
+        await R.store(bean);  // 保存到数据库
+        
+        // ... 重启监控（如需要）...
+        
+        // 发送更新到前端监控列表
+        await server.sendUpdateMonitorIntoList(socket, bean.id);
+        
+        callback({
+            ok: true,
+            msg: "Saved.",
+            msgi18n: true,
+            monitorID: bean.id,
+        });
+    } catch (e) {
+        // ... 错误处理
+    }
+});
+```
+
+#### 2.5.5 前端：Socket 接收监控列表
+
+前端 `socket.js` mixin 监听 `monitorList` 和 `updateMonitorIntoList` 事件：
+
+**文件位置：** `src/mixins/socket.js:147-163`
+
+```javascript
+// 接收完整监控列表
+socket.on("monitorList", (data) => {
+    this.assignMonitorUrlParser(data);
+    this.monitorList = data;  // 存储到 $root.monitorList
+});
+
+// 接收单个监控更新
+socket.on("updateMonitorIntoList", (data) => {
+    this.assignMonitorUrlParser(data);
+    Object.entries(data).forEach(([monitorID, updatedMonitor]) => {
+        this.monitorList[monitorID] = updatedMonitor;  // 增量更新
+    });
+});
+```
+
+`monitorList` 是 Vue 根实例的响应式数据，包含所有监控的完整信息，包括 `pushToken`。
+
+#### 2.5.6 前端：编辑页面数据绑定流程
+
+**文件位置：** `src/pages/EditMonitor.vue:3764-3854`
+
+编辑页面在 `init()` 方法中根据路由判断是添加、编辑还是克隆模式：
+
+```javascript
+methods: {
+    init() {
+        if (this.isAdd) {
+            // === 添加模式 ===
+            this.monitor = {
+                ...monitorDefaults,
+                // ... 默认值
+            };
+            // 此时 monitor.pushToken 为 undefined
+            // 在提交前会检查类型并生成令牌（见 2.1 节）
+        } else if (this.isEdit || this.isClone) {
+            // === 编辑或克隆模式 ===
+            // 通过 Socket 从后端获取单个监控数据
+            this.$root.getSocket().emit("getMonitor", this.$route.params.id, (res) => {
+                if (res.ok) {
+                    if (this.isClone) {
+                        // 克隆时：清除 pushToken，后续会重新生成
+                        if (res.monitor.type === "push") {
+                            res.monitor.pushToken = undefined;
+                        }
+                        // 克隆时还会清除其他不可继承的属性
+                        this.monitor.id = undefined;
+                        // ...
+                    }
+
+                    // === 关键绑定：将后端数据赋值给本地 this.monitor ===
+                    this.monitor = res.monitor;  // 包含 pushToken（编辑模式）
+                    
+                    // ... 其他数据处理
+                } else {
+                    this.$root.toastError(res.msg);
+                }
+            });
+        }
+        // ...
+    },
+}
+```
+
+#### 2.5.7 前端：编辑页面 Push URL 显示
+
+编辑页面通过计算属性 `pushURL` 动态构建完整的 Push 端点 URL：
+
+**文件位置：** `src/pages/EditMonitor.vue:3271-3272`
+
+```javascript
+computed: {
+    // ... 其他计算属性
+    
+    pushURL() {
+        // 使用 monitor.pushToken 构建 URL
+        return this.$root.baseURL + "/api/push/" + this.monitor.pushToken + "?status=up&msg=OK&ping=";
+    },
+    
+    // ...
+}
+```
+
+**模板中的使用：** `src/pages/EditMonitor.vue:256-267`
+
+```vue
+<div v-if="monitor.type === 'push'" class="my-3">
+    <label for="push-url" class="form-label">{{ $t("PushUrl") }}</label>
+    
+    <!-- 绑定到计算属性 pushURL -->
+    <CopyableInput id="push-url" v-model="pushURL" type="url" disabled="disabled" />
+    
+    <div class="form-text">
+        {{ $t("needPushEvery", [monitor.interval]) }}
+        <br />
+        {{ $t("pushOptionalParams", ["status, msg, ping"]) }}
+    </div>
+    
+    <!-- 重置令牌按钮 -->
+    <button class="btn btn-primary" type="button" @click="resetToken">
+        {{ $t("Reset Token") }}
+    </button>
+</div>
+```
+
+#### 2.5.8 前端：编辑页面令牌重置
+
+当用户点击"Reset Token"按钮时：
+
+**文件位置：** `src/pages/EditMonitor.vue:4006-4008`
+
+```javascript
+resetToken() {
+    // 生成新的 32 位随机令牌
+    this.monitor.pushToken = genSecret(pushTokenLength);
+}
+```
+
+这会：
+1. 更新 `this.monitor.pushToken` 的值
+2. 触发 `pushURL` 计算属性重新计算（响应式更新）
+3. UI 中的 Push URL 立即显示新令牌
+4. 用户需要点击"Save"按钮才会保存到数据库
+
+#### 2.5.9 前端：详情页面数据绑定
+
+详情页面从 `$root.monitorList` 获取监控数据：
+
+**详情页 Push URL 显示模板：** `src/pages/Details.vue:97-100`
+
+```vue
+<span v-if="monitor.type === 'push'">
+    Push:
+    <a :href="pushURL" target="_blank" rel="noopener noreferrer">{{ pushURL }}</a>
+</span>
+```
+
+**详情页计算属性：** `src/pages/Details.vue:583-585`
+
+```javascript
+computed: {
+    // ...
+    
+    pushURL() {
+        // 使用 this.monitor.pushToken
+        return this.$root.baseURL + "/api/push/" + this.monitor.pushToken + "?status=up&msg=OK&ping=";
+    },
+    
+    // ...
+}
+```
+
+**详情页数据来源：**
+详情页的 `monitor` 数据通常来自 `$root.monitorList`（通过路由参数 ID 索引），或者在某些情况下从后端获取。当监控列表通过 Socket 更新时，详情页的数据会自动响应式更新。
+
+#### 2.5.10 令牌数据绑定链路总览图
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                         Push Token 完整数据绑定链路                                                │
+├────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                                    数据层 (Database)                                        │  │
+│  │                                                                                              │  │
+│  │   ┌────────────────────────────────────────────────────────────────────────────────────┐   │  │
+│  │   │                           monitor 表                                                  │   │  │
+│  │   │   ┌─────────────┬─────────────┬─────────────┬───────────────────┐                │   │  │
+│  │   │   │     id      │    name     │    type     │    push_token     │                │   │  │
+│  │   │   ├─────────────┼─────────────┼─────────────┼───────────────────┤                │   │  │
+│  │   │   │      1      │ "My Push"   │   "push"    │ "abc123...xyz"   │                │   │  │
+│  │   │   └─────────────┴─────────────┴─────────────┴───────────────────┘                │   │  │
+│  │   │                                    │                                                  │   │  │
+│  │   │                                    ▼ RedBean ORM 自动映射                            │   │  │
+│  │   │                           bean.pushToken                                              │   │  │
+│  │   └────────────────────────────────────────────────────────────────────────────────────┘   │  │
+│  └──────────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                              │                                                     │
+│                                              ▼                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                                  后端层 (Backend)                                          │  │
+│  │                                                                                              │  │
+│  │   ┌────────────────────────────────────────────────────────────────────────────────────┐   │  │
+│  │   │                         monitor.toJSON()                                            │   │  │
+│  │   │                                                                                        │   │  │
+│  │   │   toJSON(preloadData, includeSensitiveData = true) {                                │   │  │
+│  │   │       // includeSensitiveData 默认为 true                                            │   │  │
+│  │   │       return {                                                                        │   │  │
+│  │   │           id: this.id,                                                                │   │  │
+│  │   │           name: this.name,                                                            │   │  │
+│  │   │           type: this.type,                                                            │   │  │
+│  │   │           // ... 其他字段 ...                                                         │   │  │
+│  │   │           pushToken: this.pushToken,    // ← 包含在返回数据中                        │   │  │
+│  │   │           // ...                                                                      │   │  │
+│  │   │       };                                                                               │   │  │
+│  │   │   }                                                                                    │   │  │
+│  │   └────────────────────────────────────────────────────────────────────────────────────┘   │  │
+│  │                                              │                                                 │  │
+│  │              ┌───────────────────────────────┴───────────────────────────────┐              │  │
+│  │              │                                                               │              │  │
+│  │              ▼                                                               ▼              │  │
+│  │   ┌──────────────────────┐                                     ┌──────────────────────┐   │  │
+│  │   │  getMonitorJSONList  │                                     │    getMonitor (单条)  │   │  │
+│  │   │  (监控列表)           │                                     │    (编辑/详情页)      │   │  │
+│  │   └──────────┬───────────┘                                     └──────────┬───────────┘   │  │
+│  │              │                                                               │              │  │
+│  │              ▼ Socket.io 事件                                                ▼ Socket.io 事件  │  │
+│  │   ┌──────────────────────────────┐              ┌──────────────────────────────────────┐   │  │
+│  │   │ io.to(userID).emit(         │              │ callback({                           │   │  │
+│  │   │   "monitorList", list       │              │   ok: true,                          │   │  │
+│  │   │ )                           │              │   monitor: monitor.toJSON()          │   │  │
+│  │   │                             │              │ })                                   │   │  │
+│  │   │ 或                          │              └──────────────────────────────────────┘   │  │
+│  │   │ io.to(userID).emit(         │                                                           │  │
+│  │   │   "updateMonitorIntoList",  │                                                           │  │
+│  │   │   list                      │                                                           │  │
+│  │   │ )                           │                                                           │  │
+│  │   └──────────────────────────────┘                                                           │  │
+│  └──────────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                              │                                                     │
+│                                              ▼                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                                  前端层 (Frontend)                                         │  │
+│  │                                                                                              │  │
+│  │   ┌────────────────────────────────────────────────────────────────────────────────────┐   │  │
+│  │   │                     Vue 根实例 ($root) 响应式数据                                    │   │  │
+│  │   │                                                                                        │   │  │
+│  │   │   this.monitorList = {                                                                │   │  │
+│  │   │       "1": {                                                                          │   │  │
+│  │   │           id: 1,                                                                       │   │  │
+│  │   │           name: "My Push",                                                             │   │  │
+│  │   │           type: "push",                                                                │   │  │
+│  │   │           pushToken: "abc123...xyz",    // ← 响应式数据                               │   │  │
+│  │   │           // ...                                                                       │   │  │
+│  │   │       },                                                                                │   │  │
+│  │   │       // ... 其他监控 ...                                                               │   │  │
+│  │   │   };                                                                                    │   │  │
+│  │   │                                                                                        │   │  │
+│  │   │   // Socket 事件监听                                                                    │   │  │
+│  │   │   socket.on("monitorList", (data) => {                                                │   │  │
+│  │   │       this.monitorList = data;    // 响应式更新整个列表                                │   │  │
+│  │   │   });                                                                                   │   │  │
+│  │   │                                                                                        │   │  │
+│  │   │   socket.on("updateMonitorIntoList", (data) => {                                     │   │  │
+│  │   │       // 增量更新                                                                      │   │  │
+│  │   │       Object.entries(data).forEach(([id, monitor]) => {                              │   │  │
+│  │   │           this.monitorList[id] = monitor;                                             │   │  │
+│  │   │       });                                                                               │   │  │
+│  │   │   });                                                                                   │   │  │
+│  │   └────────────────────────────────────────────────────────────────────────────────────┘   │  │
+│  │                                              │                                                 │  │
+│  │              ┌───────────────────────────────┴───────────────────────────────┐              │  │
+│  │              │                                                               │              │  │
+│  │              ▼                                                               ▼              │  │
+│  │   ┌──────────────────────┐                                     ┌──────────────────────┐   │  │
+│  │   │   编辑页面            │                                     │     详情页面          │   │  │
+│  │   │   EditMonitor.vue    │                                     │    Details.vue       │   │  │
+│  │   └──────────┬───────────┘                                     └──────────┬───────────┘   │  │
+│  │              │                                                               │              │  │
+│  │              ▼ 数据获取方式                                                  ▼ 数据获取方式   │  │
+│  │   ┌──────────────────────────────────┐              ┌──────────────────────────────────┐   │  │
+│  │   │ // 编辑模式：从后端获取单条        │              │ // 从 $root.monitorList 获取     │   │  │
+│  │   │ this.$root.getSocket().emit(     │              │ // 或通过 props/路由获取         │   │  │
+│  │   │   "getMonitor", monitorID,        │              │ this.monitor =                     │   │  │
+│  │   │   (res) => {                      │              │   this.$root.monitorList[monitorID]│   │  │
+│  │   │       this.monitor = res.monitor; │              │                                    │   │  │
+│  │   │       // 包含 pushToken            │              │ // 包含 pushToken                  │   │  │
+│  │   │   }                               │              └──────────────────────────────────┘   │  │
+│  │   │ );                              │                                                   │  │
+│  │   │                                 │                                                   │  │
+│  │   │ // 克隆模式：清除后重新生成      │                                                   │  │
+│  │   │ if (this.isClone &&             │                                                   │  │
+│  │   │     res.monitor.type === "push")│                                                   │  │
+│  │   │   res.monitor.pushToken =       │                                                   │  │
+│  │   │     undefined;                   │                                                   │  │
+│  │   │ // 提交时自动生成新令牌          │                                                   │  │
+│  │   └──────────────────────────────────┘                                                   │  │
+│  │              │                                                               │              │  │
+│  │              ▼ 数据绑定                                                      ▼ 数据绑定   │  │
+│  │   ┌──────────────────────────────────┐              ┌──────────────────────────────────┐   │  │
+│  │   │ // 本地响应式数据                 │              │ // 本地响应式数据                 │   │  │
+│  │   │ this.monitor = {                 │              │ this.monitor = {                 │   │  │
+│  │   │     id: 1,                        │              │     id: 1,                        │   │  │
+│  │   │     pushToken: "abc123...xyz",   │              │     pushToken: "abc123...xyz",   │   │  │
+│  │   │     // ...                        │              │     // ...                        │   │  │
+│  │   │ };                               │              │ };                               │   │  │
+│  │   │                                 │              │                                    │   │  │
+│  │   │ // 计算属性                       │              │ // 计算属性                       │   │  │
+│  │   │ pushURL() {                      │              │ pushURL() {                      │   │  │
+│  │   │     return this.$root.baseURL +  │              │     return this.$root.baseURL +  │   │  │
+│  │   │       "/api/push/" +             │              │       "/api/push/" +             │   │  │
+│  │   │       this.monitor.pushToken +   │              │       this.monitor.pushToken +   │   │  │
+│  │   │       "?status=up&msg=OK&ping="; │              │       "?status=up&msg=OK&ping="; │   │  │
+│  │   │ }                                │              │ }                                │   │  │
+│  │   └──────────────────────────────────┘              └──────────────────────────────────┘   │  │
+│  │              │                                                               │              │  │
+│  │              ▼ UI 显示                                                       ▼ UI 显示    │  │
+│  │   ┌──────────────────────────────────────────────────────────────────────────────────┐   │  │
+│  │   │                              Vue 模板 (Template)                                   │   │  │
+│  │   │                                                                                      │   │  │
+│  │   │   <!-- 编辑页 / 详情页共同的显示方式 -->                                           │   │  │
+│  │   │   <div v-if="monitor.type === 'push'">                                             │   │  │
+│  │   │       <!-- 绑定到计算属性 pushURL -->                                               │   │  │
+│  │   │       <CopyableInput v-model="pushURL" disabled />                                 │   │  │
+│  │   │       <!-- 或 -->                                                                   │   │  │
+│  │   │       <a :href="pushURL">{{ pushURL }}</a>                                         │   │  │
+│  │   │                                                                                      │   │  │
+│  │   │       <!-- 编辑页独有：重置按钮 -->                                                 │   │  │
+│  │   │       <button @click="resetToken">Reset Token</button>                             │   │  │
+│  │   │   </div>                                                                             │   │  │
+│  │   │                                                                                      │   │  │
+│  │   │   // resetToken 方法（编辑页）                                                       │   │  │
+│  │   │   resetToken() {                                                                     │   │  │
+│  │   │       this.monitor.pushToken = genSecret(32);  // 生成新令牌                       │   │  │
+│  │   │       // 触发 pushURL 重新计算 → UI 立即更新                                        │   │  │
+│  │   │       // 需点击 Save 才保存到数据库                                                  │   │  │
+│  │   │   }                                                                                  │   │  │
+│  │   └──────────────────────────────────────────────────────────────────────────────────┘   │  │
+│  └──────────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                              │                                                     │
+│                                              ▼ 保存流程                                            │
+│  ┌──────────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                              保存时的数据流 (编辑页)                                        │  │
+│  │                                                                                              │  │
+│  │   用户点击 "Save" 按钮                                                                       │  │
+│  │          │                                                                                   │  │
+│  │          ▼                                                                                   │  │
+│  │   this.$root.getSocket().emit(                                                              │  │
+│  │       "editMonitor",                                                                         │  │
+│  │       this.monitor,    // 包含 pushToken                                                    │  │
+│  │       (res) => { ... }                                                                      │  │
+│  │   );                                                                                         │  │
+│  │          │                                                                                   │  │
+│  │          ▼                                                                                   │  │
+│  │   后端 server.js:800-881                                                                     │  │
+│  │   socket.on("editMonitor", async (monitor, callback) => {                                  │  │
+│  │       let bean = await R.findOne("monitor", " id = ? ", [monitor.id]);                    │  │
+│  │                                                                                              │  │
+│  │       // 关键绑定：前端 monitor.pushToken → 数据库 bean.pushToken                          │  │
+│  │       bean.pushToken = monitor.pushToken;   // ← 保存到数据库                              │  │
+│  │                                                                                              │  │
+│  │       await R.store(bean);                    // 持久化                                    │  │
+│  │                                                                                              │  │
+│  │       // 发送更新到所有前端客户端                                                             │  │
+│  │       await server.sendUpdateMonitorIntoList(socket, bean.id);                             │  │
+│  │       // → 触发 "updateMonitorIntoList" 事件                                               │  │
+│  │       // → 所有打开的浏览器标签页的 $root.monitorList 自动更新                             │  │
+│  │       // → 详情页的 UI 自动响应式更新                                                       │  │
+│  │   });                                                                                        │  │
+│  └──────────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                                    │
+└────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 2.5.11 关键代码位置汇总（令牌绑定链路）
+
+| 层级 | 功能 | 文件路径 | 关键行号 |
+|------|------|----------|----------|
+| 数据层 | 数据库字段 | 表 `monitor.push_token` | - |
+| ORM 层 | 字段映射 | RedBean ORM 自动映射 | - |
+| 后端模型 | toJSON 包含 pushToken | `server/model/monitor.js` | 218, 233 |
+| 后端 | 监控列表获取 | `server/uptime-kuma-server.js` | 219-234, 256-277 |
+| 后端 | 单条监控获取 | `server/server.js` | 987-1000 |
+| 后端 | 保存监控 | `server/server.js` | 800-881, 940-954 |
+| 前端根实例 | Socket 监听 | `src/mixins/socket.js` | 147-163 |
+| 前端编辑页 | 初始化获取数据 | `src/pages/EditMonitor.vue` | 3764-3854 |
+| 前端编辑页 | pushURL 计算属性 | `src/pages/EditMonitor.vue` | 3271-3272 |
+| 前端编辑页 | 令牌重置 | `src/pages/EditMonitor.vue` | 4006-4008 |
+| 前端详情页 | pushURL 计算属性 | `src/pages/Details.vue` | 583-585 |
+
 ## 三、外部心跳接入链路
 
 ### 3.1 API 端点
