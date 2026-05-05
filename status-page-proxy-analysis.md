@@ -413,6 +413,165 @@ router.get("/api/entry-page", async (request, response) => {
 
 Uptime Kuma 内置了对 Cloudflare Tunnel 的支持，通过 `node-cloudflared-tunnel` 库实现。
 
+#### 端到端链路详解
+
+##### 架构概览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              Cloudflare 全球边缘网络                                   │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐                        │
+│  │   用户浏览器   │────▶│  Cloudflare  │────▶│  Tunnel 边缘  │                        │
+│  │              │     │   CDN/Edge   │     │    节点       │                        │
+│  └──────────────┘     └──────────────┘     └───────┬──────┘                        │
+└───────────────────────────────────────────────────────┼──────────────────────────────┘
+                                                        │
+                                                        │  出站连接 (从 Uptime Kuma 主动发起)
+                                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           用户本地网络 / 私有网络                                      │
+│                                                                                        │
+│   ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│   │                        cloudflared 进程 (独立子进程)                           │  │
+│   │                                                                                  │  │
+│   │  ┌────────────────────────────────────────────────────────────────────────┐  │  │
+│   │  │  功能:                                                                  │  │  │
+│   │  │  1. 与 Cloudflare 边缘节点建立持久的 WebSocket/QUIC 出站连接           │  │  │
+│   │  │  2. 接收来自 Cloudflare 边缘的 HTTP/WebSocket 请求                     │  │  │
+│   │  │  3. 反向代理到本地 Uptime Kuma 服务 (localhost:3001)                  │  │  │
+│   │  │  4. 将响应返回给 Cloudflare 边缘                                        │  │  │
+│   │  └────────────────────────────────────────────────────────────────────────┘  │  │
+│   │                                      │                                         │  │
+│   │                                      ▼                                         │  │
+│   │  ┌────────────────────────────────────────────────────────────────────────┐  │  │
+│   │  │                    Uptime Kuma Node.js 服务                              │  │  │
+│   │  │                    监听: localhost:3001 (默认)                           │  │  │
+│   │  │                                                                          │  │  │
+│   │  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐         │  │  │
+│   │  │  │  Express HTTP   │  │  Socket.IO      │  │  数据库操作      │         │  │  │
+│   │  │  │  Server         │  │  Server         │  │                 │         │  │  │
+│   │  │  └─────────────────┘  └─────────────────┘  └─────────────────┘         │  │  │
+│   │  └────────────────────────────────────────────────────────────────────────┘  │  │
+│   └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                        │
+│  关键特性:                                                                             │
+│  - 无需开放任何入站端口                                                                │
+│  - 所有连接都是从 cloudflared 主动向 Cloudflare 发起的出站连接                       │
+│  - 本地 Uptime Kuma 只监听 localhost，不暴露到公网                                   │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+##### 完整请求链路（以状态页访问为例）
+
+```
+步骤 1: 用户发起请求
+┌─────────────┐
+│  用户浏览器  │──────▶ GET https://status.example.com/status/my-page
+└─────────────┘
+         │
+         ▼
+步骤 2: Cloudflare DNS 解析
+- CNAME 记录指向: <tunnel-id>.cfargotunnel.com
+- Cloudflare 边缘识别这是一个 Tunnel 域名
+
+         │
+         ▼
+步骤 3: Cloudflare 边缘节点处理
+┌─────────────────────┐
+│  Cloudflare 边缘节点  │
+│                     │
+│  1. 接收用户请求      │
+│  2. 查找对应的 Tunnel │
+│  3. 通过已建立的出站  │
+│     连接发送请求到    │
+│     cloudflared      │
+└──────────┬──────────┘
+           │
+           ▼  已建立的出站 WebSocket/QUIC 连接
+           │  (从 cloudflared 主动发起，保持持久连接)
+           │
+步骤 4: cloudflared 反向代理
+┌───────────────────────────────────┐
+│        cloudflared 进程            │
+│                                   │
+│  1. 从 Cloudflare 边缘接收请求      │
+│  2. 解析 HTTP 请求                  │
+│  3. 转发到本地 Uptime Kuma:         │
+│     localhost:3001/status/my-page  │
+│  4. 接收响应并返回给 Cloudflare     │
+└──────────────┬────────────────────┘
+               │
+               ▼  HTTP 请求到 localhost:3001
+               │
+步骤 5: Uptime Kuma 处理
+┌─────────────────────────────────────────────────────────┐
+│              Uptime Kuma Node.js Server                 │
+│                                                          │
+│  1. Express 路由匹配:                                    │
+│     GET /status/:slug                                    │
+│                                                          │
+│  2. server.js 入口路由检测 (如果是根路径 /):             │
+│     - 获取 hostname (通过 X-Forwarded-Host)            │
+│     - 检查是否在 domainMappingList 中                    │
+│                                                          │
+│  3. status-page-router.js 处理:                         │
+│     - 应用 5 分钟缓存                                    │
+│     - 调用 StatusPage.handleStatusPageResponse()         │
+│                                                          │
+│  4. SSR 渲染:                                            │
+│     - 从数据库获取 status_page 记录                      │
+│     - 调用 StatusPage.getStatusPageData()               │
+│     - 收集公开监控组、事件、维护计划                      │
+│     - 注入 window.preloadData                            │
+│     - 返回完整的 HTML                                    │
+└─────────────────────────────────────────────────────────┘
+               │
+               ▼  HTTP 响应
+               │
+步骤 6: 响应返回
+cloudflared ──▶ Cloudflare 边缘 ──▶ 用户浏览器
+```
+
+##### Socket.IO 连接通过 Tunnel 的处理
+
+状态页在**公开访问模式**下**不使用** Socket.IO，只使用 HTTP API 轮询。
+
+**关键代码** (`src/mixins/socket.js:19-23`)：
+
+```javascript
+const noSocketIOPages = [
+    /^\/status-page$/, //  /status-page
+    /^\/status/, // /status**
+    /^\/$/, //  /
+];
+```
+
+**初始化逻辑** (`src/mixins/socket.js:85-98`)：
+
+```javascript
+initSocketIO(bypass = false) {
+    // 已经初始化过，不需要重新连接
+    if (this.socket.initedSocketIO) {
+        return;
+    }
+
+    // 状态页不需要连接 Socket.IO
+    if (!bypass && location.pathname) {
+        for (let page of noSocketIOPages) {
+            if (location.pathname.match(page)) {
+                return;  // 直接返回，不建立 Socket.IO 连接
+            }
+        }
+    }
+    // ... 建立 Socket.IO 连接
+}
+```
+
+**这意味着**：
+- **公开状态页** (`/status/*`)：只使用 HTTP API + 轮询，不建立 WebSocket 连接
+- **后台管理** (`/dashboard/*`)：使用 Socket.IO 进行实时通信
+- **编辑模式** (`/status/:slug?edit`)：需要登录并建立 Socket.IO 连接
+
 #### 核心实现
 
 **Socket 处理器** (`server/socket-handlers/cloudflared-socket-handler.js`)：
@@ -437,7 +596,7 @@ module.exports.cloudflaredSocketHandler = (socket) => {
     // 加入 cloudflared 房间
     socket.on(prefix + "join", async () => {
         try {
-            checkLogin(socket);
+            checkLogin(socket);  // 需要登录才能管理 cloudflared
             socket.join("cloudflared");
             io.to(socket.userID).emit(prefix + "installed", cloudflared.checkInstalled());
             io.to(socket.userID).emit(prefix + "running", cloudflared.running);
@@ -469,7 +628,7 @@ module.exports.cloudflaredSocketHandler = (socket) => {
             checkLogin(socket);
             const disabledAuth = await setting("disableAuth");
             if (!disabledAuth) {
-                await doubleCheckPassword(socket, currentPassword);
+                await doubleCheckPassword(socket, currentPassword);  // 需要密码确认
             }
             cloudflared.stop();
         } catch (error) {
