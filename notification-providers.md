@@ -6,9 +6,11 @@
 
 1. [通知渠道的注册机制](#通知渠道的注册机制)
 2. [通知渠道的配置与管理](#通知渠道的配置与管理)
-3. [监控状态变化时的通知路由](#监控状态变化时的通知路由)
-4. [模板选择与渲染机制](#模板选择与渲染机制)
-5. [重复通知抑制机制](#重复通知抑制机制)
+3. [通知配置的生效条件](#通知配置的生效条件)
+4. [监控状态变化时的通知路由](#监控状态变化时的通知路由)
+5. [通知渠道最终命中逻辑](#通知渠道最终命中逻辑)
+6. [模板选择与渲染机制](#模板选择与渲染机制)
+7. [重复通知抑制机制](#重复通知抑制机制)
 
 ---
 
@@ -274,9 +276,143 @@ static async getNotificationList(monitor) {
 
 ---
 
-## 3. 监控状态变化时的通知路由
+## 3. 通知配置的生效条件
 
-### 3.1 心跳检查流程
+### 3.1 通知配置的启停机制
+
+Uptime Kuma 的通知配置**没有单独的启用/禁用开关**。通知的"启用"或"禁用"是通过**监控项与通知配置的关联关系**来控制的。
+
+#### 核心设计
+
+- 通知配置本身存储在 `notification` 表中
+- 通知是否对某个监控生效，取决于 `monitor_notification` 关联表中是否存在对应的记录
+- 用户在编辑监控时，可以通过复选框选择启用/禁用哪些通知（即创建/删除关联关系）
+
+#### 前端实现
+
+在 `src/pages/EditMonitor.vue` 中，通知的启用状态通过 `monitor.notificationIDList` 控制：
+
+```javascript
+// 数据结构
+monitor: {
+    notificationIDList: {},  // 键为通知 ID，值为 true/false
+    // ... 其他监控配置
+}
+
+// 模板中的复选框
+<input
+    v-model="monitor.notificationIDList[notification.id]"
+    type="checkbox"
+/>
+```
+
+#### 后端实现
+
+在 `server/server.js` 中，`updateMonitorNotification` 函数负责更新关联关系：
+
+```javascript
+async function updateMonitorNotification(monitorID, notificationIDList) {
+    // 1. 删除所有现有关联
+    await R.exec("DELETE FROM monitor_notification WHERE monitor_id = ? ", [monitorID]);
+
+    // 2. 重新创建被勾选的通知的关联
+    for (let notificationID in notificationIDList) {
+        if (notificationIDList[notificationID]) {  // 值为 true 表示启用
+            let relation = R.dispense("monitor_notification");
+            relation.monitor_id = monitorID;
+            relation.notification_id = notificationID;
+            await R.store(relation);
+        }
+    }
+}
+```
+
+### 3.2 默认通知（isDefault）机制
+
+通知配置有一个 `is_default` 字段，用于标记该通知是否为"默认通知"。
+
+#### 默认通知的作用
+
+默认通知只影响**新建的监控**：
+
+- 当用户创建新监控时，前端会自动将所有标记为 `isDefault === true` 的通知添加到 `monitor.notificationIDList` 中
+- 这意味着新监控会自动关联所有"默认通知"
+
+#### 前端实现
+
+在 `src/pages/EditMonitor.vue` 的 `init()` 方法中：
+
+```javascript
+if (this.isAdd) {
+    // 新建监控时，自动启用所有默认通知
+    for (let i = 0; i < this.$root.notificationList.length; i++) {
+        if (this.$root.notificationList[i].isDefault === true) {
+            this.monitor.notificationIDList[this.$root.notificationList[i].id] = true;
+        }
+    }
+}
+```
+
+### 3.3 默认通知扩散到存量监控的规则
+
+`isDefault` 标记**不会自动扩散到已有的监控**。如果需要将通知应用到现有监控，需要显式操作。
+
+#### 方式一：创建/编辑通知时勾选"应用到所有现有监控"
+
+在 `src/components/NotificationDialog.vue` 中，用户可以勾选 `applyExisting` 选项：
+
+```html
+<div class="form-check form-switch">
+    <input v-model="notification.applyExisting" class="form-check-input" type="checkbox" />
+    <label class="form-check-label">{{ $t("Apply on all existing monitors") }}</label>
+</div>
+```
+
+当用户勾选此选项并保存时，后端会执行 `applyNotificationEveryMonitor()` 函数：
+
+```javascript
+// server/notification.js
+async function applyNotificationEveryMonitor(notificationID, userID) {
+    // 1. 获取用户的所有监控
+    let monitors = await R.getAll("SELECT id FROM monitor WHERE user_id = ?", [userID]);
+
+    // 2. 遍历每个监控，检查是否已关联该通知
+    for (let i = 0; i < monitors.length; i++) {
+        let checkNotification = await R.findOne(
+            "monitor_notification", 
+            " monitor_id = ? AND notification_id = ? ", 
+            [monitors[i].id, notificationID]
+        );
+
+        // 3. 如果未关联，则创建关联
+        if (!checkNotification) {
+            let relation = R.dispense("monitor_notification");
+            relation.monitor_id = monitors[i].id;
+            relation.notification_id = notificationID;
+            await R.store(relation);
+        }
+    }
+}
+```
+
+#### 方式二：在每个监控的编辑页面手动启用
+
+用户可以在每个监控的编辑页面，通过复选框手动启用/禁用特定的通知配置。
+
+### 3.4 生效条件总结
+
+| 场景 | 新建监控 | 现有监控 |
+|------|----------|----------|
+| `isDefault = true` | 自动启用 | 无影响 |
+| `isDefault = false` | 不自动启用 | 无影响 |
+| 创建时勾选 `applyExisting` | 自动启用 | 为所有现有监控启用 |
+| 编辑监控时勾选/取消勾选 | - | 为该监控启用/禁用 |
+
+---
+
+## 4. 监控状态变化时的通知路由
+
+### 4.1 心跳检查流程
 
 监控项的心跳检查在 `server/model/monitor.js` 的 `start()` 方法中实现，核心逻辑在内部的 `beat()` 函数中：
 
@@ -318,7 +454,7 @@ async start(io) {
 }
 ```
 
-### 3.2 重要心跳判断
+### 4.2 重要心跳判断
 
 `isImportantBeat()` 方法判断一次心跳是否"重要"：
 
@@ -354,7 +490,7 @@ static isImportantBeat(isFirstBeat, previousBeatStatus, currentBeatStatus) {
 }
 ```
 
-### 3.3 通知触发判断
+### 4.3 通知触发判断
 
 `isImportantForNotification()` 方法进一步过滤需要发送通知的情况：
 
@@ -376,7 +512,7 @@ static isImportantForNotification(isFirstBeat, previousBeatStatus, currentBeatSt
 }
 ```
 
-### 3.4 发送通知
+### 4.4 发送通知
 
 `sendNotification()` 方法实际执行通知发送：
 
@@ -408,13 +544,17 @@ static async sendNotification(isFirstBeat, monitor, bean) {
 
         // 如果是从 DOWN 恢复到 UP，计算并添加停机时间信息
         if (bean.status === UP && monitor.id) {
-            const lastDownHeartbeat = await R.getRow(
-                "SELECT time FROM heartbeat WHERE monitor_id = ? AND status = ? AND important = 1 " +
-                "ORDER BY time DESC LIMIT 1",
-                [monitor.id, DOWN]
-            );
-            if (lastDownHeartbeat && lastDownHeartbeat.time) {
-                heartbeatJSON["lastDownTime"] = lastDownHeartbeat.time;
+            try {
+                const lastDownHeartbeat = await R.getRow(
+                    "SELECT time FROM heartbeat WHERE monitor_id = ? AND status = ? AND important = 1 " +
+                    "ORDER BY time DESC LIMIT 1",
+                    [monitor.id, DOWN]
+                );
+                if (lastDownHeartbeat && lastDownHeartbeat.time) {
+                    heartbeatJSON["lastDownTime"] = lastDownHeartbeat.time;
+                }
+            } catch (error) {
+                // 如果计算停机时间失败，继续执行而不中断通知发送
             }
         }
 
@@ -438,7 +578,7 @@ static async sendNotification(isFirstBeat, monitor, bean) {
 }
 ```
 
-### 3.5 通知分发
+### 4.5 通知分发
 
 `server/notification.js` 中的 `send()` 方法根据通知类型分发到对应的 provider：
 
@@ -455,9 +595,198 @@ static async send(notification, msg, monitorJSON = null, heartbeatJSON = null) {
 
 ---
 
-## 4. 模板选择与渲染机制
+## 5. 通知渠道最终命中逻辑
 
-### 4.1 模板渲染引擎
+### 5.1 完整的命中流程
+
+当监控状态变化需要发送通知时，系统按照以下流程决定最终命中哪些通知渠道：
+
+```
+┌─────────────────────┐
+│  监控状态变化        │
+│  (需要发送通知)      │
+└──────────┬──────────┘
+           │
+           ▼
+┌──────────────────────────────────────┐
+│  1. 获取监控关联的通知配置            │
+│     Monitor.getNotificationList()    │
+│     (查询 monitor_notification 表)   │
+└──────────┬───────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────┐
+│  2. 遍历每个通知配置                  │
+│     for (notification of list) {     │
+└──────────┬───────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────┐
+│  3. 解析配置 JSON                     │
+│     JSON.parse(notification.config)  │
+└──────────┬───────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────┐
+│  4. 检查 provider 是否存在            │
+│     providerList[notification.type]  │
+└──────────┬───────────────────────────┘
+           │
+      ┌────┴────┐
+      │         │
+     存在      不存在
+      │         │
+      ▼         ▼
+┌─────────┐  ┌─────────────────┐
+│5. 调用  │  │  抛出错误       │
+│provider │  │  "Notification  │
+│.send()  │  │   type not      │
+└────┬────┘  │   supported"    │
+     │       └─────────────────┘
+     ▼
+┌─────────────────┐
+│  6. 发送通知成功 │
+│  或记录失败日志  │
+└─────────────────┘
+```
+
+### 5.2 关键步骤详解
+
+#### 步骤 1：获取关联的通知配置
+
+```javascript
+// server/model/monitor.js
+static async getNotificationList(monitor) {
+    let notificationList = await R.getAll(
+        "SELECT notification.* FROM notification, monitor_notification " +
+        "WHERE monitor_id = ? AND monitor_notification.notification_id = notification.id ",
+        [monitor.id]
+    );
+    return notificationList;
+}
+```
+
+**关键点**：
+- 只查询 `monitor_notification` 关联表中存在的记录
+- **不考虑** `is_default` 字段（`is_default` 只在新建监控时自动建立关联）
+- **不考虑**通知配置本身是否有"启用"状态（Uptime Kuma 没有这个概念）
+
+#### 步骤 2-4：通知类型检查
+
+```javascript
+// server/notification.js
+static async send(notification, msg, monitorJSON = null, heartbeatJSON = null) {
+    if (this.providerList[notification.type]) {
+        return this.providerList[notification.type].send(notification, msg, monitorJSON, heartbeatJSON);
+    } else {
+        throw new Error("Notification type is not supported");
+    }
+}
+```
+
+**关键点**：
+- `notification.type` 必须与 `providerList` 中的某个键匹配
+- 这个 `type` 值存储在 `notification.config` JSON 中，由前端表单设置
+
+#### 步骤 5-6：发送通知
+
+每个通知提供商的 `send()` 方法实现不同，但都遵循相同的模式：
+
+```javascript
+// 以 Webhook 为例
+async send(notification, msg, monitorJSON = null, heartbeatJSON = null) {
+    const okMsg = "Sent Successfully.";
+
+    try {
+        // 1. 从 notification 配置中提取参数
+        const httpMethod = notification.httpMethod?.toLowerCase() || "post";
+        const webhookURL = notification.webhookURL;
+        // ... 其他配置
+
+        // 2. 准备请求数据
+        let data = {
+            heartbeat: heartbeatJSON,
+            monitor: monitorJSON,
+            msg,
+        };
+
+        // 3. 发送请求
+        if (httpMethod === "get") {
+            await axios.get(webhookURL, config);
+        } else {
+            await axios.post(webhookURL, data, config);
+        }
+
+        return okMsg;
+    } catch (error) {
+        this.throwGeneralAxiosError(error);
+    }
+}
+```
+
+### 5.3 影响最终命中的因素
+
+#### 因素 1：monitor_notification 关联关系
+
+这是**最重要**的因素。只有在 `monitor_notification` 表中存在关联记录的通知配置才会被考虑。
+
+建立关联的方式：
+1. **新建监控时**：所有 `isDefault = true` 的通知会自动关联
+2. **创建/编辑通知时**：勾选 `applyExisting` 会为所有现有监控建立关联
+3. **编辑监控时**：用户手动勾选复选框建立/解除关联
+
+#### 因素 2：notification.type 的有效性
+
+`notification.type` 必须与后端注册的某个 provider 匹配。常见的 type 值：
+
+| type 值 | 通知渠道 |
+|---------|----------|
+| `slack` | Slack |
+| `telegram` | Telegram |
+| `webhook` | Webhook |
+| `smtp` | SMTP 邮件 |
+| `discord` | Discord |
+| `teams` | Microsoft Teams |
+| ... | ... |
+
+#### 因素 3：通知配置的完整性
+
+某些通知渠道需要特定的配置参数才能正常工作：
+
+- **Slack**：需要 `slackwebhookURL`
+- **Telegram**：需要 `bottoken` 和 `chatid`
+- **SMTP**：需要 `smtpHost`、`smtpPort`、`smtpSecure`、`smtpFrom`、`smtpTo` 等
+- **Webhook**：需要 `webhookURL`
+
+如果配置不完整，通知发送会失败，但不会影响其他通知的发送。
+
+### 5.4 失败处理
+
+单个通知发送失败不会阻止其他通知的发送：
+
+```javascript
+// server/model/monitor.js
+for (let notification of notificationList) {
+    try {
+        await Notification.send(
+            JSON.parse(notification.config),
+            msg,
+            monitor.toJSON(preloadData, false),
+            heartbeatJSON
+        );
+    } catch (e) {
+        // 记录错误，但继续处理下一个通知
+        log.error("monitor", "Cannot send notification to " + notification.name);
+        log.error("monitor", e);
+    }
+}
+```
+
+---
+
+## 6. 模板选择与渲染机制
+
+### 6.1 模板渲染引擎
 
 Uptime Kuma 使用 **LiquidJS** 作为模板渲染引擎，在 `NotificationProvider.renderTemplate()` 方法中实现：
 
@@ -503,7 +832,7 @@ async renderTemplate(template, msg, monitorJSON, heartbeatJSON) {
 }
 ```
 
-### 4.2 模板变量说明
+### 6.2 模板变量说明
 
 | 变量名 | 类型 | 说明 |
 |--------|------|------|
@@ -517,7 +846,7 @@ async renderTemplate(template, msg, monitorJSON, heartbeatJSON) {
 | `NAME` | string | 与 `name` 相同（v1 兼容） |
 | `HOSTNAME_OR_URL` | string | 与 `hostnameOrURL` 相同（v1 兼容） |
 
-### 4.3 Webhook 自定义模板示例
+### 6.3 Webhook 自定义模板示例
 
 `server/notification-providers/webhook.js` 展示了如何使用自定义模板：
 
@@ -539,7 +868,7 @@ async send(notification, msg, monitorJSON = null, heartbeatJSON = null) {
 }
 ```
 
-### 4.4 Slack 自定义模板示例
+### 6.4 Slack 自定义模板示例
 
 `server/notification-providers/slack.js` 中的模板使用：
 
@@ -569,9 +898,9 @@ async send(notification, msg, monitorJSON = null, heartbeatJSON = null) {
 
 ---
 
-## 5. 重复通知抑制机制
+## 7. 重复通知抑制机制
 
-### 5.1 状态变化驱动的通知
+### 7.1 状态变化驱动的通知
 
 Uptime Kuma 的通知机制核心是**基于状态变化**，只有在以下情况才会发送通知：
 
@@ -581,7 +910,7 @@ Uptime Kuma 的通知机制核心是**基于状态变化**，只有在以下情�
 4. **PENDING → DOWN**：重试后确认故障
 5. **MAINTENANCE → DOWN**：维护模式中检测到故障
 
-### 5.2 持续故障的重发机制
+### 7.2 持续故障的重发机制
 
 对于持续 DOWN 的状态，Uptime Kuma 提供了**定时重发**机制：
 
@@ -630,7 +959,7 @@ if (!isImportant) {
 7. **心跳 7**：DOWN → DOWN（非重要，`downCount = 1`）
 8. ...
 
-### 5.3 证书过期通知的抑制
+### 7.3 证书过期通知的抑制
 
 证书过期通知使用 `notification_sent_history` 表来记录已发送的通知，避免重复发送：
 
@@ -680,7 +1009,7 @@ async sendCertNotificationByTargetDays(certCN, certType, daysRemaining, targetDa
 | monitor_id | INTEGER | 关联的监控 ID |
 | days | INTEGER | 触发通知的剩余天数阈值 |
 
-### 5.4 维护模式的通知抑制
+### 7.4 维护模式的通知抑制
 
 维护模式下的状态变化会被特殊处理：
 
@@ -692,7 +1021,7 @@ async sendCertNotificationByTargetDays(certCN, certType, daysRemaining, targetDa
 // - 只有 MAINTENANCE → DOWN 会发送通知（维护中检测到新故障）
 ```
 
-### 5.5 PENDING 状态的处理
+### 7.5 PENDING 状态的处理
 
 PENDING（重试中）状态有特殊的通知规则：
 
@@ -725,8 +1054,11 @@ PENDING（重试中）状态有特殊的通知规则：
 | `server/notification-providers/notification-provider.js` | 通知提供商基类 |
 | `server/notification-providers/*.js` | 各通知提供商的具体实现 |
 | `server/model/monitor.js` | 监控模型，包含心跳检查和通知触发逻辑 |
+| `server/server.js` | 服务器主入口，包含监控通知关联更新逻辑 |
 | `src/components/notifications/index.js` | 前端通知组件注册 |
 | `src/components/notifications/*.vue` | 各通知提供商的前端配置表单 |
+| `src/components/NotificationDialog.vue` | 通知配置对话框 |
+| `src/pages/EditMonitor.vue` | 监控编辑页面 |
 
 ### C. 通知发送流程图
 
@@ -777,4 +1109,49 @@ PENDING（重试中）状态有特殊的通知规则：
                               ┌─────────────────┐
                               │   等待下次心跳   │
                               └─────────────────┘
+```
+
+### D. 通知渠道命中决策流程图
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   监控状态变化                        │
+│         (满足 isImportantForNotification 条件)       │
+└───────────────────────┬─────────────────────────────┘
+                        │
+                        ▼
+              ┌───────────────────────┐
+              │ 查询 monitor_notification│
+              │ 获取关联的通知配置列表   │
+              └───────────┬───────────┘
+                          │
+            ┌─────────────┴─────────────┐
+            │                             │
+            ▼                             ▼
+    ┌───────────────┐            ┌─────────────────┐
+    │ 列表为空       │            │ 列表有通知配置   │
+    │ (不发送任何通知)│            └────────┬────────┘
+    └───────────────┘                     │
+                                          │
+                              ┌───────────┴───────────┐
+                              │                       │
+                              ▼                       ▼
+                    ┌───────────────┐       ┌───────────────────┐
+                    │ 遍历每个通知   │       │ 解析 notification.  │
+                    │ 配置          │──────▶│ config 获取 type    │
+                    └───────────────┘       └─────────┬─────────┘
+                                                        │
+                                          ┌─────────────┴─────────────┐
+                                          │                             │
+                                          ▼                             ▼
+                                ┌───────────────────┐         ┌─────────────────────┐
+                                │ type 在 providerList│         │ type 不在 providerList │
+                                │ 中存在             │         │ 中存在               │
+                                └─────────┬─────────┘         └──────────┬──────────┘
+                                          │                                │
+                                          ▼                                ▼
+                                ┌───────────────────┐         ┌─────────────────────┐
+                                │ 调用 provider.send()│         │ 抛出错误并记录日志   │
+                                │ 发送通知           │         │ (不影响其他通知)    │
+                                └───────────────────┘         └─────────────────────┘
 ```
