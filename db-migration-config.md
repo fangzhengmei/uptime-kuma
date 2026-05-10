@@ -2,11 +2,12 @@
 
 ## 1. 概述
 
-本文档深入分析 Uptime Kuma 项目中的数据库迁移机制、应用配置持久化方式，以及跨版本升级时的兼容处理策略。重点澄清三个核心问题：
+本文档深入分析 Uptime Kuma 项目中的数据库迁移机制、应用配置持久化方式，以及跨版本升级时的兼容处理策略。重点澄清四个核心问题：
 
 1. **Setup 流程**：`db-config.json`、`kuma.db`、`needSetup` 的真实分支与优先级
-2. **Setting 机制**：持久化方式、JSON 与非 JSON 值的差异、缓存条件
+2. **Setting 机制**：持久化方式、JSON 与非 JSON 值的差异、缓存条件、直接写入路径
 3. **聚合迁移**：中断、跳过、恢复场景下的语义与风险
+4. **兼容影响**：非标准值在各种读取路径下的行为
 
 ---
 
@@ -63,7 +64,7 @@
 | 1 | 读取 `db-config.json` 成功 | 跳过 kuma.db 检查 | `false` |
 | 2 | `db-config.json` 失败 且 `kuma.db` 存在 | 自动生成 `db-config.json`（type: sqlite） | `false` |
 | 3 | `db-config.json` 失败 且 `kuma.db` 不存在 | 不生成配置文件 | `true` |
-| 4 | **无论之前什么状态**，`UPTIME_KUMA_DB_TYPE` 存在 | 用环境变量覆盖 `db-config.json` | **强制 `false`** |
+| 4 | **无论之前什么状态**，`UPTIME_KUMA_DB_TYPE` 存在 | 用环境变量覆盖 `db-config.json` | **强制 `false` |
 
 **关键发现**：
 - 环境变量的优先级体现在**第二阶段的强制覆盖**，而不是跳过第一阶段
@@ -202,29 +203,29 @@ needSetup 决策优先级：
 
 ## 3. Setting 持久化与缓存机制
 
-### 3.1 两个 Setting API
+### 3.1 三个读写路径概览
 
-Uptime Kuma 有两套 Setting API，存在历史演进关系：
+Uptime Kuma 的 setting 表存在**多条独立的读写路径**，这是理解其复杂行为的关键。
 
-| API | 位置 | 实现 |
-|-----|------|------|
-| 旧 API（兼容性） | `server/util-server.js:384-397` | `setting()` / `setSetting()` → 委托给 Settings 类 |
-| 新 API（推荐） | `server/settings.js` | `Settings` 类 |
+#### 3.1.1 三条写入路径
 
-```javascript
-// server/util-server.js:384-397
-exports.setting = async function (key) {
-    return await Settings.get(key);
-};
+| 路径 | 写入方式 | JSON 序列化 | 使用示例 |
+|------|---------|------------|---------|
+| **路径 A** | `Settings.set()` | ✅ 是 | `title`、`description`、`checkUpdate` |
+| **路径 B** | `Settings.setSettings()` | ✅ 是 | 批量设置某类型的配置 |
+| **路径 C** | `initJWTSecret()` | ❌ 否 | `jwtSecret`（特殊历史遗留） |
 
-exports.setSetting = async function (key, value, type = null) {
-    await Settings.set(key, value, type);
-};
-```
+#### 3.1.2 三条读取路径
 
-### 3.2 持久化机制：全 JSON 序列化
+| 路径 | 读取方式 | JSON 解析 | 使用缓存 | 使用示例 |
+|------|---------|----------|---------|---------|
+| **路径 X** | `Settings.get()` | ✅ 是 | ✅ 是（条件） | 大部分单个配置读取 |
+| **路径 Y** | `Settings.getSettings()` | ✅ 是 | ❌ 否 | 按类型批量读取 |
+| **路径 Z** | `R.findOne()` / `R.getCell()` | ❌ 否 | ❌ 否 | `jwtSecret`、迁移脚本内部 |
 
-**重要修正**：所有值的写入都是 JSON 序列化，不存在"非 JSON 值"的写入路径。
+### 3.2 标准写入路径：JSON 序列化
+
+#### 路径 A：Settings.set()
 
 ```javascript
 // server/settings.js:73-84
@@ -242,25 +243,84 @@ static async set(key, value, type = null) {
 }
 ```
 
-**写入时的值处理**：
+#### 路径 B：Settings.setSettings()
 
-| 输入值 | JSON.stringify 结果 | 数据库存储 |
-|--------|-------------------|-----------|
-| `"hello"` | `"\"hello\""` | `text` 类型 |
-| `123` | `"123"` | `text` 类型 |
-| `true` | `"true"` | `text` 类型 |
-| `{a: 1}` | `"{\"a\":1}"` | `text` 类型 |
-| `null` | `"null"` | `text` 类型 |
-| `undefined` | `"undefined"` | `text` 类型 |
+```javascript
+// server/settings.js:117-134
+for (let key of keyList) {
+    let bean = await R.findOne("setting", " `key` = ? ", [key]);
+    // ...
+    if (bean.type === type) {
+        bean.value = JSON.stringify(data[key]);  // 同样 JSON.stringify
+        promiseList.push(R.store(bean));
+    }
+}
+```
 
-**关键发现**：
-- 无论输入什么类型，`set()` 都会用 `JSON.stringify()` 序列化
-- 数据库的 `value` 列是 `text` 类型，所有值都存储为字符串
-- 没有分支逻辑判断"是否需要 JSON 序列化"
+**标准写入时的值处理**：
 
-### 3.3 读取机制：JSON 解析 + 失败回退
+| 输入值 | JSON.stringify 结果 | 数据库存储（value 列） |
+|--------|-----------------|---------------------|
+| `"hello"` | `"\"hello\""` | `"\"hello\""`（带引号的字符串） |
+| `123` | `"123"` | `"123"`（数字字符串） |
+| `true` | `"true"` | `"true"`（布尔字符串） |
+| `{a: 1}` | `"{\"a\":1}"` | `"{\"a\":1}"`（对象序列化） |
+| `null` | `"null"` | `"null"`（null 字符串） |
+| `undefined` | `"undefined"` | `"undefined"` |
 
-读取时才存在"JSON 值"和"非 JSON 值"的区分：
+### 3.3 特殊写入路径：initJWTSecret（绕过 JSON 序列化）
+
+**这是代码库中**唯一**的直接写入路径，不经过 `JSON.stringify()`：
+
+```javascript
+// server/util-server.js:42-52
+exports.initJWTSecret = async () => {
+    let jwtSecretBean = await R.findOne("setting", " `key` = ? ", ["jwtSecret"]);
+
+    if (!jwtSecretBean) {
+        jwtSecretBean = R.dispense("setting");
+        jwtSecretBean.key = "jwtSecret";
+    }
+
+    // 关键：直接设置 value，不经过 JSON.stringify
+    jwtSecretBean.value = await passwordHash.generate(genSecret());
+    await R.store(jwtSecretBean);
+    return jwtSecretBean;
+};
+```
+
+**jwtSecret 的写入值特点**：
+
+- `passwordHash.generate()` 返回的是**原始字符串**（如 bcrypt hash）
+- **没有** `JSON.stringify()`
+- 数据库中存储的是**裸字符串**，没有 JSON 引号
+
+**示例对比**：
+
+| 写入方式 | 代码 | 数据库中存储的值 |
+|---------|------|-----------------|
+| 标准路径（Settings.set） | `bean.value = JSON.stringify("abc")` | `"\"abc\""`（带引号） |
+| 特殊路径（initJWTSecret） | `bean.value = "abc"` | `"abc"`（裸字符串） |
+
+### 3.4 历史遗留值的可能性
+
+除了 `initJWTSecret` 这个明确的直接写入路径，数据库中可能还存在其他"非 JSON 值"：
+
+#### 场景 1：1.X 版本的历史数据
+
+在 `patch-setting-value-type.sql` 之前的版本中，setting 表可能有直接插入的原始值。迁移脚本只是重建表结构，**不会**对现有值进行重新编码：
+
+```sql
+-- db/old_migrations/patch-setting-value-type.sql
+-- 只是复制数据，不做 JSON 转换
+insert into setting_dg_tmp(id, key, value, type) select id, key, value, type from setting;
+```
+
+#### 场景 2：迁移脚本中的直接操作
+
+某些迁移脚本可能直接使用 SQL INSERT/UPDATE 操作 setting 表，绕过 Settings API。
+
+### 3.5 读取路径 X：Settings.get()（JSON 解析 + 条件缓存）
 
 ```javascript
 // server/settings.js:28-64
@@ -280,7 +340,7 @@ static async get(key) {
     if (key in Settings.cacheList) {
         const v = Settings.cacheList[key].value;
         log.debug("settings", `Get Setting (cache): ${key}: ${v}`);
-        return v;  // 直接返回缓存值，不做任何处理
+        return v;  // 直接返回缓存值
     }
 
     // 3. 从数据库读取原始字符串
@@ -305,7 +365,9 @@ static async get(key) {
 }
 ```
 
-**读取时的值处理**：
+#### 对不同类型值的行为
+
+**标准 JSON 值（通过 Settings.set 写入）：
 
 | 数据库存储 | JSON.parse 结果 | 返回值 | 是否缓存 |
 |-----------|----------------|--------|---------|
@@ -314,12 +376,100 @@ static async get(key) {
 | `"true"` | `true`（布尔） | `true` | ✅ 是 |
 | `"{\"a\":1}"` | `{a: 1}`（对象） | `{a: 1}` | ✅ 是 |
 | `"null"` | `null` | `null` | ✅ 是 |
-| `"undefined"` | `undefined` | `undefined` | ✅ 是 |
-| `"hello"`（无引号） | SyntaxError | `"hello"`（原始字符串） | ❌ **否** |
-| `""`（空字符串） | SyntaxError | `""`（原始字符串） | ❌ **否** |
-| `undefined`（DB 无此 key） | SyntaxError | `undefined` | ❌ **否** |
 
-### 3.4 缓存机制的准确描述
+**特殊非 JSON 值（initJWTSecret 或历史遗留）：
+
+| 数据库存储 | JSON.parse 结果 | 返回值 | 是否缓存 |
+|-----------|----------------|--------|---------|
+| `"abc123xyz"`（裸字符串） | SyntaxError | `"abc123xyz"`（原始字符串） | ❌ **否** |
+| `""`（空字符串） | SyntaxError | `""` | ❌ 否 |
+| `undefined`（DB 无此 key） | SyntaxError | `undefined` | ❌ 否 |
+
+**关键发现**：`jwtSecret` 如果用 `Settings.get("jwtSecret")` 读取：
+- `JSON.parse()` 会**失败**（因为是裸字符串，不是合法 JSON）
+- 返回原始字符串（值是正确的）
+- **不会被缓存**
+
+### 3.6 读取路径 Y：Settings.getSettings()（JSON 解析 + 无缓存）
+
+```javascript
+// server/settings.js:91-105
+static async getSettings(type) {
+    // 直接查询数据库，不检查 cacheList
+    let list = await R.getAll("SELECT `key`, `value` FROM setting WHERE `type` = ? ", [type]);
+
+    let result = {};
+
+    for (let row of list) {
+        try {
+            result[row.key] = JSON.parse(row.value);
+        } catch (e) {
+            // 解析失败也直接返回原始值
+            result[row.key] = row.value;
+        }
+    }
+
+    return result;
+}
+```
+
+#### getSettings() 的关键特性：
+
+1. **不使用 `cacheList` 缓存**：每次都查数据库
+2. **同样尝试 JSON 解析**：成功返回解析后的值，失败返回原始字符串
+3. **按类型筛选**：只返回 `type` 列匹配的记录
+
+#### 对非 JSON 值的行为：
+
+| 值类型 | JSON.parse | 返回值 | 是否缓存 |
+|--------|------------|--------|---------|
+| 标准 JSON 值 | 成功 | 解析后的值 | ❌ 否（本来就不缓存） |
+| 非 JSON 值（如 jwtSecret） | 失败 | 原始字符串 | ❌ 否 |
+
+**jwtSecret 的特殊性：`jwtSecret` 没有 `type` 列的值（`initJWTSecret` 写入时没有设置 `bean.type）
+
+```javascript
+// initJWTSecret 中：
+jwtSecretBean.key = "jwtSecret";
+// 没有设置 jwtSecretBean.type → type 为 null 或 undefined
+jwtSecretBean.value = ...
+```
+
+所以 `jwtSecret` **不会**被 `getSettings()` 返回，除非查询时 `type` 为 null。
+
+### 3.7 读取路径 Z：直接数据库操作（完全绕过 Settings API
+
+这是 `jwtSecret` 实际使用的读取路径：
+
+```javascript
+// server/server.js:1852-1868
+// 直接用 R.findOne() 读取，不经过 Settings.get()
+let jwtSecretBean = await R.findOne("setting", " `key` = ? ", ["jwtSecret"]);
+
+if (!jwtSecretBean) {
+    jwtSecretBean = await initJWTSecret();
+}
+
+// 直接访问 .value 属性
+server.jwtSecret = jwtSecretBean.value;
+```
+
+**路径 Z 的特点：
+
+1. **不解析**：直接使用 `bean.value`，没有 `JSON.parse()`
+2. **不缓存**：完全绕过 `Settings.cacheList`
+3. **最可靠**：无论值是否为 JSON 格式都正确工作
+
+**三种读取路径对比表
+
+| 特性 | Settings.get() | Settings.getSettings() | R.findOne().value |
+|------|----------------|------------------------|-------------------|
+| JSON 解析 | ✅ 是 | ✅ 是 | ❌ 否 |
+| 使用缓存 | ✅ 是（条件） | ❌ 否 | ❌ 否 |
+| 对非 JSON 值 | 返回原始值（不缓存） | 返回原始值 | 返回原始值 |
+| 对 JSON 标准值 | 返回解析后的值（缓存） | 返回解析后的值 | 返回 JSON 字符串（**危险！** |
+
+### 3.8 缓存机制详解
 
 #### 缓存数据结构
 
@@ -336,19 +486,22 @@ Settings.cacheList = {
 };
 ```
 
-#### 缓存条件（写入缓存的时机）
+#### 缓存写入的严格条件
 
-**只有满足以下所有条件才会写入缓存**：
+**只有同时满足以下所有条件才会写入缓存**：
 
-1. **通过 `Settings.get(key)` 读取**（`getSettings()` 方法的读取不经过此缓存）
+1. **通过 `Settings.get(key)` 读取**（`getSettings()` 或 `R.findOne()` 不使用此缓存）
 2. **从数据库成功读取到值**（不是 `undefined`）
 3. **JSON.parse() 解析成功**（没有抛出异常）
 
-**不会缓存的情况**：
+**不会缓存的场景**：
 
-1. `JSON.parse()` 抛出异常（解析失败）
-2. 数据库中不存在该 key（`R.getCell()` 返回 `undefined`）
-3. 通过 `Settings.getSettings(type)` 批量读取（没有缓存逻辑）
+| 场景 | 原因 |
+|------|------|
+| `jwtSecret` 用 Settings.get() 读取 | JSON.parse 失败（非 JSON 值） |
+| 数据库中不存在该 key | `R.getCell()` 返回 `undefined` |
+| 通过 Settings.getSettings() 读取 | 方法本身没有缓存逻辑 |
+| 通过 R.findOne() 直接读取 | 完全绕过缓存系统 |
 
 #### 缓存生命周期
 
@@ -405,77 +558,154 @@ static deleteCache(keyList) {
 1. `Settings.set()` 调用时 → `Settings.deleteCache([key])`
 2. `Settings.setSettings()` 调用时 → `Settings.deleteCache(keyList)`
 
-**注意**：`deleteCache` 只清除内存缓存，不影响数据库。
+**注意**：`initJWTSecret()` **不会**调用 `deleteCache()`，因为它绕过了 Settings API。
 
-### 3.5 getSettings() 的特殊行为
+### 3.9 非标准值的兼容影响深度分析
 
-`getSettings()` 方法有独立的逻辑，**不使用** `cacheList` 缓存：
+#### 场景 1：jwtSecret 用不同读取路径的行为
+
+假设数据库中 `jwtSecret` 的值为：`"$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"`（原始 bcrypt hash，没有 JSON 引号）
+
+| 读取方式 | 代码 | 返回值 | 类型 | 是否可用 |
+|---------|------|--------|------|---------|
+| 路径 X（Settings.get） | `Settings.get("jwtSecret")` | `"$2a$10$..."` | 字符串 | ✅ 可用（但不缓存） |
+| 路径 Y（getSettings） | `getSettings("...")` | `"$2a$10$..."` | 字符串 | ✅ 可用（但 type 为 null） |
+| 路径 Z（R.findOne） | `R.findOne(...).value` | `"$2a$10$..."` | 字符串 | ✅ 可用（实际使用路径） |
+
+#### 场景 2：如果有人错误地用 Settings.set("jwtSecret", ...) 写入
 
 ```javascript
-// server/settings.js:91-105
-static async getSettings(type) {
-    // 直接查询数据库，不检查 cacheList
-    let list = await R.getAll("SELECT `key`, `value` FROM setting WHERE `type` = ? ", [type]);
+// 错误用法：
+await Settings.set("jwtSecret", "$2a$10$N9qo8uLO...");
 
-    let result = {};
-
-    for (let row of list) {
-        try {
-            result[row.key] = JSON.parse(row.value);
-        } catch (e) {
-            // 解析失败也直接返回原始值，同样不缓存
-            result[row.key] = row.value;
-        }
-    }
-
-    return result;
-}
+// 数据库中存储的是：
+"\"$2a$10$N9qo8uLO...\""  // 带 JSON 引号！
 ```
 
-**getSettings() vs get() 的区别**：
+此时各读取路径的行为：
 
-| 特性 | `get(key)` | `getSettings(type)` |
-|------|-----------|--------------------|
-| 缓存 | 使用 `cacheList` | 不使用任何缓存 |
-| 查询方式 | 单条查询 | 按类型批量查询 |
-| 解析失败处理 | 不缓存 | 不缓存（本来就没缓存） |
-| 性能特征 | 热点数据快，冷数据慢 | 每次都查库，稳定 |
+| 读取方式 | 返回值 | 是否可用 |
+|---------|--------|---------|
+| 路径 X（Settings.get） | `"$2a$10$..."`（解析后） | ✅ 可用（被缓存） |
+| 路径 Y（getSettings） | `"$2a$10$..."`（解析后） | ✅ 可用 |
+| 路径 Z（R.findOne.value） | `"\"$2a$10$N9qo8uLO...\""`（带引号的字符串！） | ❌ **不可用！** |
 
-### 3.6 Setting 机制总结图
+**关键风险**：实际代码使用路径 Z 读取，会得到带引号的字符串，JWT 验证会失败！
+
+#### 场景 3：缓存不一致问题
+
+假设 `jwtSecret` 被 `initJWTSecret()` 更新了（重置密码场景）：
 
 ```
-写入路径（统一 JSON 序列化）：
-  set(key, value)
-       │
-       ▼
-  JSON.stringify(value)
-       │
-       ▼
-  写入 setting 表的 value 列（text 类型）
-       │
-       ▼
-  deleteCache([key])  ───► 清除内存缓存
+时间线：
+T1: 某人用 Settings.get("jwtSecret") 读取
+    → JSON.parse 失败
+    → 返回原始值
+    → 不缓存（因为解析失败）
 
+T2: initJWTSecret() 被调用，生成新的 jwtSecret
+    → 直接写入数据库
+    → 不调用 deleteCache()（但 jwtSecret 本来就没被缓存）
 
-读取路径（JSON 解析 + 条件缓存）：
-  get(key)
-       │
-       ├─ 命中 cacheList ──────────────────► 返回缓存值
-       │
-       └─ 未命中
-            │
-            ▼
-       SELECT value FROM setting
-            │
-            ▼
-       JSON.parse(value)
-            │
-            ├─ 成功 ───► 写入 cacheList（timestamp = now）
-            │                  │
-            │                  └─ 返回解析后的值
-            │
-            └─ 失败 ───► 返回原始字符串（不缓存）
+T3: 再用 Settings.get("jwtSecret") 读取
+    → 读取到新值
+    → 正常（因为没被缓存过）
+
+问题：如果之前有人用另一个 key（如 "checkUpdate" 读取后缓存了，会不会有问题？
+
+T1: Settings.get("checkUpdate") → 读取 → 缓存（解析成功 → 写入缓存
+
+T2: Settings.set("checkUpdate", false) → 写入 DB → deleteCache(["checkUpdate"])
+
+T3: Settings.get("checkUpdate") → 未命中缓存 → 重新读取 → 正确
 ```
+
+**jwtSecret 特殊情况**：
+
+| 操作 | 缓存状态 |
+|------|----------|
+| `Settings.get("jwtSecret")` | 未缓存（解析失败） |
+| `initJWTSecret()` 被调用 | 不影响缓存（本来就没缓存） |
+| 再次 `Settings.get("jwtSecret")` | 读取新值，仍未缓存 |
+
+**结论**：`jwtSecret` 由于解析失败不会被缓存，所以即使 `initJWTSecret()` 不调用 `deleteCache()` 也不会有缓存一致性问题。但这是**巧合**，不是设计。
+
+### 3.10 Setting 机制全景图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         写入路径                                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  路径 A：Settings.set(key, value, type)                          │
+│       └─ JSON.stringify(value)                                     │
+│       └─ deleteCache([key])                                      │
+│                                                                   │
+│  路径 B：Settings.setSettings(type, data)                        │
+│       └─ JSON.stringify(data[key])                                  │
+│       └─ deleteCache(keyList)                                      │
+│                                                                   │
+│  路径 C：initJWTSecret()                                         │
+│       └─ 直接设置 bean.value = passwordHash.generate(...)               │
+│       └─ 不 JSON.stringify                                      │
+│       └─ 不 deleteCache                                         │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    setting 表（value 列是 text 类型）              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  标准值（路径 A/B 写入）：                                         │
+│    key: "title"                                                   │
+│    value: "\"My Uptime Kuma\""  (JSON 序列化，带引号)              │
+│    type: "general"                                               │
+│                                                                   │
+│  特殊值（路径 C 写入）：                                          │
+│    key: "jwtSecret"                                             │
+│    value: "$2a$10$N9qo8uLO..."  (原始字符串，无引号)         │
+│    type: null 或 undefined                                       │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         读取路径                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  路径 X：Settings.get(key)                                          │
+│       └─ 检查 cacheList（命中则直接返回）                             │
+│       └─ SELECT value FROM setting                                    │
+│       └─ JSON.parse(value)                                          │
+│       ├─ 成功 → 写入 cacheList → 返回解析后的值                       │
+│       └─ 失败 → 返回原始值（不缓存）                               │
+│                                                                   │
+│  路径 Y：Settings.getSettings(type)                              │
+│       └─ SELECT key, value FROM setting WHERE type = ?           │
+│       └─ JSON.parse(row.value)                                   │
+│       ├─ 成功 → result[row.key] = 解析后的值                      │
+│       └─ 失败 → result[row.key] = 原始值                        │
+│       └─ 不使用 cacheList                                         │
+│                                                                   │
+│  路径 Z：R.findOne("setting", "key = ?", ...)                    │
+│       └─ 直接访问 bean.value                                      │
+│       └─ 不 JSON.parse                                            │
+│       └─ 不使用 cacheList                                         │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.11 关键发现总结
+
+| 问题 | 答案 |
+|------|------|
+| 是否存在非 JSON 写入路径？ | ✅ 是，`initJWTSecret()` 是唯一明确的直接写入路径 |
+| "全量 JSON 写入"是否正确？ | ❌ 不正确，需要修正为"标准路径 JSON 序列化，特殊路径原始写入" |
+| jwtSecret 如何读取？ | 通过路径 Z（`R.findOne().value`），完全绕过 Settings API |
+| jwtSecret 用 Settings.get() 读会怎样？ | 返回正确值，但不会缓存（因为 JSON.parse 失败） |
+| initJWTSecret() 会清缓存吗？ | ❌ 不会，但 jwtSecret 本来就不被缓存，所以没问题 |
+| 历史遗留值存在吗？ | ✅ 可能存在（1.X 数据、迁移脚本直接操作） |
 
 ---
 
@@ -489,27 +719,27 @@ static async getSettings(type) {
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  migrateAggregateTable() 执行流程                        │
+│  migrateAggregateTable() 执行流程                │
 ├─────────────────────────────────────────────────────────┤
-│  1. 检查 SET_MIGRATE_AGGREGATE_TABLE_TO_TRUE 环境变量    │
-│     └─ 如设为 1：直接设为 migrated，跳过所有逻辑          │
-│                                                         │
-│  2. 读取 migrateAggregateTableState 设置                 │
-│     ├─ "migrated"  ──► 直接返回（已完成）                 │
-│     ├─ "migrating" ──► throw Error（拒绝启动）           │
-│     └─ 其他/空     ──► 继续                              │
-│                                                         │
-│  3. 检查 stat_* 表是否为空                               │
-│     └─ 任一表有数据 ──► 直接返回（不启动迁移）             │
-│                                                         │
-│  4. 设置状态为 "migrating"                               │
-│                                                         │
+│  1. 检查 SET_MIGRATE_AGGREGATE_TABLE_TO_TRUE 环境变量 │
+│     └─ 如设为 1：直接设为 migrated，跳过所有逻辑      │
+│                                                   │
+│  2. 读取 migrateAggregateTableState 设置           │
+│     ├─ "migrated"  ──► 直接返回（已完成）       │
+│     ├─ "migrating" ──► throw Error（拒绝启动）   │
+│     └─ 其他/空     ──► 继续                      │
+│                                                   │
+│  3. 检查 stat_* 表是否为空                     │
+│     └─ 任一表有数据 ──► 直接返回（不启动迁移）       │
+│                                                   │
+│  4. 设置状态为 "migrating"                       │
+│                                                   │
 │  5. 遍历所有 monitor，遍历所有日期，重新计算统计           │
 │     └─ 写入 stat_minutely / stat_hourly / stat_daily     │
-│                                                         │
-│  6. 清理旧的 heartbeat 数据                              │
-│                                                         │
-│  7. 设置状态为 "migrated"                                │
+│                                                   │
+│  6. 清理旧的 heartbeat 数据                          │
+│                                                   │
+│  7. 设置状态为 "migrated"                            │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -520,7 +750,7 @@ static async getSettings(type) {
 | 状态值 | 含义 | 后续行为 |
 |--------|------|---------|
 | `undefined` / `""` / 不存在 | 未开始迁移 | 尝试执行迁移 |
-| `"migrating"` | 迁移中（或已中断） | **抛出错误，拒绝启动** |
+| `"migrating"` | 迁移中（或已中断） | **抛出错误，拒绝启动 |
 | `"migrated"` | 迁移完成 | 跳过迁移 |
 
 ### 4.3 中断场景分析
@@ -560,7 +790,7 @@ static async getSettings(type) {
 #### 4.3.3 中断的风险
 
 | 中断时机 | stat_* 表状态 | heartbeat 表状态 | 数据一致性 |
-|---------|--------------|-----------------|-----------|
+|---------|-----------------|---------------|-----------|
 | 阶段 2 刚完成 | 空 | 完整 | 一致（未开始） |
 | 阶段 3 进行中 | 部分 monitor 已处理 | 完整 | **不一致** |
 | 阶段 4（清理）进行中 | 可能完整 | 部分已清理 | **不一致** |
@@ -1074,11 +1304,16 @@ let mariadbPoolConfig = {
 
 ### 7.2 Setting 机制设计
 
-1. **写入统一**：所有值通过 `JSON.stringify()` 序列化
-2. **读取容错**：`JSON.parse()` 失败时返回原始字符串
-3. **条件缓存**：只有解析成功的值才写入缓存
+1. **双写入路径**：
+   - 标准路径（`Settings.set()` / `setSettings()`）：全 JSON 序列化
+   - 特殊路径（`initJWTSecret()`）：原始字符串，不序列化
+2. **三读取路径**：
+   - `Settings.get()`：JSON 解析 + 条件缓存
+   - `Settings.getSettings()`：JSON 解析 + 无缓存
+   - `R.findOne()`：直接读取 + 无解析 + 无缓存
+3. **条件缓存**：只有 `Settings.get()` 且 JSON.parse 成功才缓存
 4. **懒启动清理**：缓存清理器在第一次读取时启动
-5. **双 API 兼容**：保留旧 `setting()` API 委托给新 `Settings` 类
+5. **历史兼容**：保留非 JSON 值的读取支持
 
 ### 7.3 迁移系统设计
 
@@ -1108,7 +1343,7 @@ let mariadbPoolConfig = {
 |---------|------|
 | `server/database.js` | 数据库核心类，迁移执行逻辑，聚合迁移 |
 | `server/settings.js` | 设置表管理，缓存机制 |
-| `server/util-server.js` | 旧版 setting API（委托给 Settings） |
+| `server/util-server.js` | 旧版 setting API、`initJWTSecret()` 直接写入 |
 | `server/setup-database.js` | Setup 决策流程，needSetup 状态 |
 | `server/config.js` | 服务器配置（端口、SSL 等） |
 | `db/knex_init_db.js` | MariaDB 初始表结构 |
@@ -1130,8 +1365,9 @@ let mariadbPoolConfig = {
   - 引入聚合表统计（`stat_minutely` / `stat_hourly` / `stat_daily`）
   - 引入 `db-config.json` 配置文件
   - 支持 MariaDB 数据库
+  - 引入 `initJWTSecret()` 作为特殊写入路径
 
 ---
 
 **报告生成日期**：2026-05-10
-**报告版本**：2.0（重大修订，重点澄清 setup 流程、setting 机制、聚合迁移风险）
+**报告版本**：3.0（重大修订：修正全量 JSON 写入结论，补充直接写入路径分析，深入分析非标准值的兼容影响）
