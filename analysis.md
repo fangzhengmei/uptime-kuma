@@ -866,37 +866,226 @@ module.exports.sendHttpError = (res, msg = "") => {
 - ⚠️ **`default` 是高度可猜测的**
 - ⚠️ **404 行为允许蛮力枚举**
 
-#### 5.8.6 404 行为的可观测差异
+#### 5.8.6 各端点 404 响应类型的差异分析
 
-让我详细分析 404 响应是否存在可用于枚举的特征：
+经过详细代码审查，发现各端点在 slug 不存在时的响应行为**有显著差异**，需要仔细区分：
 
-**公开端点的 404 响应**：
+##### 端点分类
 
-| 端点 | slug 存在 | slug 不存在 | 可观测差异 |
-|------|----------|------------|-----------|
-| `GET /status/:slug`（HTML） | 200 + Vue 应用 | 404 + `{"status":"fail","msg":"Status Page Not Found"}` | ✅ 明显差异 |
-| `GET /api/status-page/:slug` | 200 + JSON 数据 | 404 + `{"status":"fail","msg":"Status Page Not Found"}` | ✅ 明显差异 |
-| `GET /api/status-page/heartbeat/:slug` | 200 + JSON 数组 | 404 + `{"status":"fail","msg":"Not Found"}` | ✅ 明显差异 |
-| `GET /api/status-page/:slug/incident-history` | 200 + JSON 分页 | 404 + `{"status":"fail","msg":"Status Page Not Found"}` | ✅ 明显差异 |
-| `GET /api/status-page/:slug/badge` | 200 + SVG 图片 | 404 + `{"status":"fail","msg":"Not Found"}` | ✅ 明显差异 |
-| `GET /status/:slug/rss` | 200 + XML | 404 + `{"status":"fail","msg":"Status Page Not Found"}` | ✅ 明显差异 |
-| `GET /api/status-page/:slug/manifest.json` | 200 + JSON | 404 + `{"status":"fail","msg":"Not Found"}` | ✅ 明显差异 |
+根据代码逻辑，可将端点分为三类：
 
-**响应时间分析**：
-- 存在的 slug：需要数据库查询 → 可能略慢
-- 不存在的 slug：数据库查询返回空 → 可能略快
-- 差异可能很小，但理论上存在时序攻击空间
+| 类型 | 端点 | slug 不存在时的响应 | 可用于枚举 |
+|------|------|-------------------|-----------|
+| **HTML Fallback（SPA 路由）** | `GET /status/:slug`、`GET /status/:slug/rss` | 404 + `indexHTML`（Vue 应用） | ⚠️ 可观测 |
+| **JSON 错误** | `GET /api/status-page/:slug`、`GET /api/status-page/:slug/incident-history`、`GET /api/status-page/:slug/manifest.json` | 404 + JSON 错误 | ✅ 可枚举 |
+| **静默失败（无 404）** | `GET /api/status-page/heartbeat/:slug`、`GET /api/status-page/:slug/badge` | 200 + 空数据/N/A | ❌ **不可枚举** |
 
-**缓存影响**：
-- 公开 API 使用 `apicache` 中间件
-- 存在的 slug 会被缓存
-- 不存在的 slug 可能不会被缓存
-- 这可能导致响应时间差异更加明显
+##### 详细分析
 
-**评估结论**：
-- ⚠️ **完全可蛮力枚举**：所有公开端点都有明显的 404 vs 200 差异
-- ⚠️ **缓存机制可能放大差异**
-- 但枚举所有可能的 slug 仍然需要时间和计算资源
+**类型 1：HTML Fallback（SPA 路由）**
+
+**代码路径**：
+- `GET /status/:slug` → `server/model/status_page.js:57-71`
+- `GET /status/:slug/rss` → `server/model/status_page.js:38-48`
+
+```javascript
+// handleStatusPageResponse
+if (statusPage) {
+    response.send(await StatusPage.renderHTML(indexHTML, statusPage));
+} else {
+    response.status(404).send(UptimeKumaServer.getInstance().indexHTML);  // SPA fallback
+}
+```
+
+**响应特征**：
+- **状态码**：404
+- **响应体**：Vue 应用的 HTML（`indexHTML`）
+- **Content-Type**：`text/html`
+
+**可观测性评估**：
+- ✅ **状态码差异**：存在的 slug 返回 200，不存在的返回 404
+- ⚠️ **响应体相同**：都返回 Vue 应用 HTML
+- ⚠️ **缓存影响**：都使用 5 分钟缓存
+- **枚举可行性**：⚠️ 中等（可通过状态码区分，但响应体相同）
+
+**类型 2：JSON 错误**
+
+**代码路径**：
+- `GET /api/status-page/:slug` → `server/routers/status-page-router.js:39-60`
+- `GET /api/status-page/:slug/incident-history` → `server/routers/status-page-router.js:145-167`
+- `GET /api/status-page/:slug/manifest.json` → `server/routers/status-page-router.js:113-143`
+
+```javascript
+// 示例：状态页数据 API
+if (!statusPage) {
+    sendHttpError(response, "Status Page Not Found");
+    return null;
+}
+```
+
+**`sendHttpError` 函数**（`server/util-server.js:710-727`）：
+```javascript
+module.exports.sendHttpError = (res, msg = "") => {
+    if (msg.toLowerCase().includes("not found")) {
+        res.status(404).json({
+            status: "fail",
+            msg: msg,
+        });
+    }
+    // ...
+};
+```
+
+**响应特征**：
+- **状态码**：404
+- **响应体**：JSON 错误，格式为 `{"status":"fail","msg":"..."}`
+- **Content-Type**：`application/json`
+- **消息差异**：
+  - 状态页数据 API：`"Status Page Not Found"`
+  - Manifest API：`"Not Found"`
+  - 事件历史 API：`"Status Page Not Found"`
+
+**可观测性评估**：
+- ✅ **状态码差异**：明显（200 vs 404）
+- ✅ **响应体差异**：明显（正常数据 vs JSON 错误）
+- ✅ **Content-Type 差异**：明显
+- ⚠️ **缓存影响**：都使用缓存
+- **枚举可行性**：✅ 高（多重差异可利用）
+
+**类型 3：静默失败（无 404）**
+
+**代码路径**：
+- `GET /api/status-page/heartbeat/:slug` → `server/routers/status-page-router.js:64-110`
+- `GET /api/status-page/:slug/badge` → `server/routers/status-page-router.js:170-262`
+
+**心跳 API 的静默失败**（`server/routers/status-page-router.js:64-110`）：
+```javascript
+router.get("/api/status-page/heartbeat/:slug", cache("1 minutes"), async (request, response) => {
+    try {
+        // ...
+        let statusPageID = await StatusPage.slugToID(slug);  // 不存在时返回 null
+
+        let monitorIDList = await R.getCol(
+            // 查询公开分组中的监控
+            `SELECT monitor_group.monitor_id FROM monitor_group, \`group\`
+             WHERE ... AND \`group\`.status_page_id = ?`,
+            [statusPageID]  // 如果 statusPageID 是 null，查询返回空数组
+        );
+
+        // 如果 monitorIDList 为空，跳过循环
+        for (let monitorID of monitorIDList) {
+            // ...
+        }
+
+        response.json({
+            heartbeatList,  // 空对象 {}
+            uptimeList,     // 空对象 {}
+        });
+    } catch (error) {
+        sendHttpError(response, error.message);
+    }
+});
+```
+
+**徽章 API 的静默失败**（`server/routers/status-page-router.js:170-262`）：
+```javascript
+router.get("/api/status-page/:slug/badge", cache("5 minutes"), async (request, response) => {
+    // ...
+    const statusPageID = await StatusPage.slugToID(slug);  // 不存在时返回 null
+
+    let monitorIDList = await R.getCol(
+        // 查询公开分组中的监控
+        `SELECT monitor_group.monitor_id FROM monitor_group, \`group\`
+         WHERE ... AND \`group\`.status_page_id = ?`,
+        [statusPageID]  // 如果 statusPageID 是 null，查询返回空数组
+    );
+
+    // ...
+    if (!hasUp && !hasDown && !hasMaintenance) {
+        // 空数组时返回 N/A 徽章
+        badgeValues.message = "N/A";
+        badgeValues.color = badgeConstants.naColor;
+    }
+
+    const svg = makeBadge(badgeValues);
+    response.type("image/svg+xml");
+    response.send(svg);
+});
+```
+
+**响应特征**：
+
+| 端点 | slug 存在 | slug 不存在 | 差异 |
+|------|----------|------------|------|
+| 心跳 API | 200 + `{ heartbeatList: {...}, uptimeList: {...} }` | 200 + `{ heartbeatList: {}, uptimeList: {} }` | ⚠️ 仅数据内容差异 |
+| 徽章 API | 200 + SVG（Up/Down/Degraded/Maintenance） | 200 + SVG（N/A） | ⚠️ 仅徽章内容差异 |
+
+**可观测性评估**：
+- ❌ **状态码相同**：都是 200
+- ⚠️ **响应体内容差异**：
+  - 心跳 API：空对象 vs 有数据对象
+  - 徽章 API：N/A 徽章 vs 正常状态徽章
+- ⚠️ **缓存影响**：都使用缓存
+- **枚举可行性**：❌ **不可靠**
+  - 心跳 API：空对象可能意味着：
+    1. slug 不存在
+    2. slug 存在但没有公开分组
+    3. slug 存在、有公开分组但分组中没有监控
+  - 徽章 API：N/A 徽章可能意味着：
+    1. slug 不存在
+    2. slug 存在但没有公开分组
+    3. slug 存在、有公开分组但分组中没有监控
+
+**关键发现**：心跳 API 和徽章 API **无法可靠地用于枚举 slug**，因为它们在多种场景下都会返回类似的"空"响应。
+
+##### 缓存影响的详细分析
+
+**缓存配置**（`server/routers/status-page-router.js`）：
+
+| 端点 | 缓存时间 | 对枚举的影响 |
+|------|---------|-------------|
+| `GET /status/:slug` | 5 分钟 | ⚠️ 首次访问后缓存，后续访问响应时间一致 |
+| `GET /status/:slug/rss` | 5 分钟 | ⚠️ 同上 |
+| `GET /api/status-page/:slug` | 5 分钟 | ⚠️ 同上 |
+| `GET /api/status-page/heartbeat/:slug` | 1 分钟 | ⚠️ 同上 |
+| `GET /api/status-page/:slug/manifest.json` | 1440 分钟（1 天） | ⚠️ 缓存时间最长 |
+| `GET /api/status-page/:slug/incident-history` | 5 分钟 | ⚠️ 同上 |
+| `GET /api/status-page/:slug/badge` | 5 分钟 | ⚠️ 同上 |
+
+**缓存对枚举的影响**：
+1. **首次访问**：
+   - 存在的 slug：数据库查询 + 生成响应 + 缓存
+   - 不存在的 slug：数据库查询 + 生成 404 响应 + 可能不缓存
+   - ⚠️ **理论上存在响应时间差异**
+
+2. **后续访问**：
+   - 存在的 slug：从缓存返回
+   - 不存在的 slug：如果不缓存，需要重新查询数据库
+   - ⚠️ **响应时间差异可能更明显**
+
+3. **但**：
+   - `apicache` 可能缓存错误响应（需要进一步验证）
+   - 即使不缓存，时序攻击需要大量请求才能检测到差异
+   - 实际枚举效率可能较低
+
+##### 最终可枚举性评估
+
+基于以上详细分析，重新评估各端点的枚举可行性：
+
+| 端点 | 可枚举性 | 说明 |
+|------|---------|------|
+| `GET /api/status-page/:slug` | ✅ **高** | 404 + JSON 错误，多重差异 |
+| `GET /api/status-page/:slug/incident-history` | ✅ **高** | 同上 |
+| `GET /api/status-page/:slug/manifest.json` | ✅ **高** | 同上 |
+| `GET /status/:slug`（HTML） | ⚠️ **中** | 状态码差异，但响应体相同（都是 Vue 应用） |
+| `GET /status/:slug/rss` | ⚠️ **中** | 同上 |
+| `GET /api/status-page/heartbeat/:slug` | ❌ **低** | 200 + 空对象，无法区分"不存在"和"无监控" |
+| `GET /api/status-page/:slug/badge` | ❌ **低** | 200 + N/A 徽章，无法区分"不存在"和"无监控" |
+
+**核心结论**：
+- ✅ **JSON API 端点**（数据、事件历史、manifest）是**最可靠**的枚举目标
+- ⚠️ **HTML 端点**可以枚举，但不够明显
+- ❌ **心跳 API 和徽章 API**无法可靠用于枚举，因为它们在多种场景下都会返回类似的"空"响应
 
 #### 5.8.7 状态页列表的获取渠道
 
@@ -1149,38 +1338,146 @@ Uptime Kuma 的公开状态页设计采用了**多层裁剪和隔离机制**：
 - 存在数据泄露风险：隐藏状态页可通过 slug 枚举访问
 - 最大风险是**虚假安全感**：管理员可能误以为 `published=0` 可以保护数据
 
-### 7.3 风险评估总结
+### 7.3 slug 获取渠道的关键发现
 
-#### 7.3.1 整体风险等级
+#### 7.3.1 可枚举 vs 可猜测的区分
 
-**⭐⭐⭐⭐（中高风险）**
+| 攻击类型 | 是否存在 | 描述 |
+|---------|---------|------|
+| **直接可枚举所有 slug** | ❌ 不存在 | 没有公开接口返回完整状态页列表 |
+| **部分可枚举** | ⚠️ 存在 | `/api/entry-page` 可枚举域名匹配的 slug |
+| **可猜测（直接获取）** | ⚠️ 存在 | 如果入口页面是状态页，直接返回 slug |
+| **可猜测（已知默认）** | ⚠️ 存在 | `default` 是高度可猜测的默认 slug |
+| **可蛮力枚举** | ⚠️ 存在 | 通过 404 vs 200 差异枚举 |
 
-#### 7.3.2 风险矩阵
+#### 7.3.2 `/api/entry-page` 的泄露机制
 
-| 维度 | 评估 |
-|------|------|
-| 触发概率 | 低到中（取决于升级路径和管理员操作） |
-| 数据暴露范围 | 高（所有公开分组数据完全可访问） |
-| 攻击前置条件 | 知道或猜测 slug（`default` 很容易猜测） |
-| 利用难度 | 极低（标准 HTTP 请求即可） |
+这是一个**关键发现**：
 
-#### 7.3.3 风险缓解建议
+```javascript
+// server/routers/api-router.js:28-45
+router.get("/api/entry-page", async (request, response) => {
+    let result = {};
+    // ...
+    if (hostname in StatusPage.domainMappingList) {
+        result.type = "statusPageMatchedDomain";
+        result.statusPageSlug = StatusPage.domainMappingList[hostname];
+    } else {
+        result.type = "entryPage";
+        result.entryPage = server.entryPage;  // 可能是 "statusPage-{slug}"
+    }
+    response.json(result);
+});
+```
 
-**立即缓解**：
-1. **不要依赖 `published` 字段**：这是当前最有效的缓解方式
-2. **通过分组控制**：不希望公开的监控，不要添加到公开分组
-3. **检查数据库**：执行 `SELECT slug, published FROM status_page;` 确认所有状态页的 `published` 状态
+**泄露场景**：
+1. **域名映射泄露**：如果知道绑定的域名，访问该域名的 `/api/entry-page` 直接返回 slug
+2. **入口页面泄露**：如果入口页面是状态页，任何访问 `/api/entry-page` 都会返回 `"statusPage-{slug}"`
 
-**长期修复（需要代码修改）**：
-1. 在所有公开端点添加 `published=1` 校验
-2. 或者完全移除 `published` 字段，避免混淆
-3. 实现真正的密码保护功能
+**风险等级**：
+- 入口页面 = 状态页 + `published=0`：⭐⭐⭐⭐⭐（极高风险）
+- 有域名映射 + `published=0`：⭐⭐⭐⭐⭐（极高风险）
 
-### 7.4 最终结论
+#### 7.3.3 404 行为的可观测差异
 
-Uptime Kuma 的公开数据保护主要依赖于**分组的公开性**（`group.public` 字段），而不是状态页的发布态（`status_page.published`）。这意味着：
+所有公开端点都有明显的 404 vs 200 差异：
 
-- 如果不希望数据被公开，**不要将监控添加到公开分组**
-- 仅设置 `published=0` **无法阻止未登录用户访问数据**
-- 这是一个需要注意的设计特性（或潜在 bug）
-- **管理员不应依赖 `published` 字段作为安全控制**
+| 端点 | slug 存在 | slug 不存在 | 可枚举性 |
+|------|----------|------------|---------|
+| `GET /status/:slug` | 200 + HTML | 404 + JSON 错误 | ⚠️ 可蛮力枚举 |
+| `GET /api/status-page/:slug` | 200 + JSON 数据 | 404 + JSON 错误 | ⚠️ 可蛮力枚举 |
+| 所有其他公开 API | 同上 | 同上 | ⚠️ 可蛮力枚举 |
+
+**关键发现**：
+- 缓存机制可能放大响应时间差异
+- 但枚举所有可能的 slug 仍然需要时间和计算资源
+
+### 7.4 风险评估总结（重算版）
+
+#### 7.4.1 新的风险评估框架
+
+| 维度 | 权重 | 说明 |
+|------|------|------|
+| **触发概率** | 25% | `published=0` 出现的可能性 |
+| **slug 获取难度** | 35% | 攻击者获取 slug 的难易程度（最重要） |
+| **数据暴露范围** | 25% | 未登录用户可以访问的数据量 |
+| **利用难度** | 15% | 攻击的技术门槛 |
+
+#### 7.4.2 综合风险矩阵
+
+| 场景 | 触发概率 | slug 获取难度 | 数据暴露 | 利用难度 | 综合风险 |
+|------|---------|--------------|---------|---------|---------|
+| 入口页面 = 状态页 + `published=0` | 低-中 | **直接获取**（评分 1） | 高 | 极低 | ⭐⭐⭐⭐⭐ |
+| 域名映射 + `published=0` | 低-中 | **直接获取**（评分 2） | 高 | 极低 | ⭐⭐⭐⭐⭐ |
+| 默认状态页 `default` + `published=0` | 中 | **高度可猜测**（评分 2） | 高 | 极低 | ⭐⭐⭐⭐⭐ |
+| 自定义简单 slug + `published=0` | 中 | **中等可猜测**（评分 4） | 高 | 低 | ⭐⭐⭐⭐ |
+| 自定义复杂 slug + `published=0` | 中 | **需蛮力枚举**（评分 7） | 高 | 低-中 | ⭐⭐⭐ |
+| 无公开分组 + `published=0` | 中 | 同上 | **无数据** | 极低 | ⭐ |
+
+#### 7.4.3 关键前置条件（AND 关系）
+
+要成功利用漏洞，必须同时满足：
+
+1. ✅ `status_page.published = 0`
+2. ✅ 攻击者能够获取 slug
+3. ✅ 状态页至少有一个公开分组（`group.public = 1`）
+4. ✅ 公开分组中至少有一个监控
+
+**最危险的组合**：
+```
+published=0 
+AND (entryPage=statusPage-* OR 有域名映射 OR slug=default)
+AND 有公开分组
+AND 分组中有监控
+```
+→ **风险等级：⭐⭐⭐⭐⭐（极高风险）**
+
+#### 7.4.4 风险缓解的优先级（重排）
+
+| 优先级 | 措施 | 说明 | 实施难度 |
+|-------|------|------|---------|
+| **P0（紧急）** | 检查并确保所有状态页 `published=1` | 直接消除触发条件 | 低 |
+| **P0（紧急）** | 不将敏感监控添加到公开分组 | 减少数据暴露范围 | 低 |
+| **P1（高）** | 避免使用简单/可猜测的 slug | 增加获取难度 | 低 |
+| **P1（高）** | 避免将状态页设为入口页面 | 关闭直接获取渠道 | 低 |
+| **P1（高）** | 避免使用域名映射 | 关闭直接获取渠道 | 中 |
+| **P2（中）** | 修改代码添加 `published=1` 校验 | 长期修复 | 中 |
+| **P3（低）** | 实现真正的密码保护 | 长期增强 | 高 |
+
+### 7.5 最终结论
+
+Uptime Kuma 的公开数据保护主要依赖于**分组的公开性**（`group.public` 字段），而不是状态页的发布态（`status_page.published`）。
+
+**关键发现总结**：
+
+1. **`published` 字段形同虚设**：
+   - 所有公开 API 端点都没有校验 `published` 字段
+   - 仅按 `slug` 查询，未发布的状态页仍然完全可访问
+
+2. **`published=0` 的触发路径**：
+   - 数据库迁移（从旧版本升级）
+   - 手工修改数据库
+   - 数据库导入/恢复
+   - 第三方脚本操作
+
+3. **后台保存不会覆盖**：
+   - 保存时 `published` 字段的更新代码被注释掉
+   - `published=0` 一旦设置，会永久保留
+
+4. **slug 获取渠道分析**：
+   - ❌ **不存在直接可枚举所有 slug 的公开接口**
+   - ⚠️ **`/api/entry-page` 可部分枚举**（域名匹配或入口页面）
+   - ⚠️ **`default` 是高度可猜测的**
+   - ⚠️ **404 行为允许蛮力枚举**
+
+5. **关键前置条件**：
+   - 必须同时满足 4 个条件才能成功利用
+   - 最危险的组合是入口页面是状态页 + `published=0` + 有公开分组
+
+**最终建议**：
+
+- ⚠️ **不要依赖 `published` 字段**：这是当前最有效的缓解方式
+- ⚠️ **通过分组控制**：不希望公开的监控，不要添加到公开分组
+- ⚠️ **检查数据库**：执行 `SELECT slug, published FROM status_page;` 确认所有状态页的 `published` 状态
+- ⚠️ **避免风险配置**：不要将状态页设为入口页面，避免使用域名映射，使用复杂的 slug
+- 🔧 **长期修复**：修改代码添加 `published=1` 校验，或完全移除该字段避免混淆
