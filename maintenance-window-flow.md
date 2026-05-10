@@ -180,14 +180,43 @@ try {
         bean.status = MAINTENANCE;
     } else if (this.type === "http" || this.type === "keyword" || this.type === "json-query") {
         // 正常监控逻辑...
+    } else if (this.type === "ping") {
+        // Ping 探测...
+    } else if (this.type === "push") {
+        // Push 检查...
+    } else if (this.type === "docker") {
+        // Docker 容器检查...
     }
+    // ... 其他监控类型
 }
 ```
 
 **关键点：**
-- 监控任务**不会停止**，而是继续执行检查
-- 但在维护期间，检查结果会被强制设置为 `MAINTENANCE` 状态
-- 实际的网络请求/检查仍然会执行，但结果被覆盖
+- 使用 `if...else if` 结构，**维护期间监控探测被完全跳过**
+- 当 `isUnderMaintenance()` 返回 `true` 时，所有 `else if` 分支（HTTP/Ping/Docker 等实际探测）都不会执行
+- 心跳记录的 `status` 字段直接设置为 `MAINTENANCE`，不会执行任何网络请求或系统调用
+
+### 3.1.1 代码结构分析
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ try {                                                       │
+│   if (isUnderMaintenance)    ──┬── true  ──▶ 跳过所有探测    │
+│       bean.status = MAINTENANCE│                            │
+│   else if (http/keyword/json)  │                            │
+│       执行 HTTP 请求          ──┴── false ──▶ 执行对应探测    │
+│   else if (ping)                                              │
+│       执行 Ping 探测                                         │
+│   else if (push)                                              │
+│       检查 Push 心跳                                         │
+│   else if (docker)                                            │
+│       检查 Docker 容器                                       │
+│   ...                                                         │
+│ }                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**设计意图：** 在维护期间完全不消耗系统资源进行探测，因为已知服务可能处于不可用或不稳定状态。
 
 ### 3.2 维护状态判断逻辑
 
