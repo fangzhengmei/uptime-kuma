@@ -207,6 +207,418 @@ Uptime Kuma 采用以下策略划分字段边界：
 
 ---
 
+## 附录 A：HTTP、TCP、Ping、DNS 四类监控类型详细对比
+
+### A.1 共享基础字段与类型专属字段对照表
+
+以下是四类监控类型的字段对照，明确哪些字段是共享的，哪些是类型专属的：
+
+#### A.1.1 字段类别说明
+
+| 类别 | 说明 |
+|------|------|
+| ✅ 共享 | 所有四类监控都使用的字段 |
+| ⚠️ 部分共享 | 部分类型使用的字段 |
+| ❌ 不使用 | 特定类型不使用的字段 |
+
+#### A.1.2 共享字段明细
+
+| 字段名 | HTTP | TCP | Ping | DNS | 说明 |
+|--------|------|-----|------|-----|------|
+| `id` | ✅ | ✅ | ✅ | ✅ | 监控唯一标识 |
+| `name` | ✅ | ✅ | ✅ | ✅ | 友好名称 |
+| `description` | ✅ | ✅ | ✅ | ✅ | 描述 |
+| `type` | ✅ | ✅ | ✅ | ✅ | 类型标识（http/port/ping/dns） |
+| `active` | ✅ | ✅ | ✅ | ✅ | 是否激活 |
+| `parent` | ✅ | ✅ | ✅ | ✅ | 父监控ID（分组） |
+| `interval` | ✅ | ✅ | ✅ | ✅ | 检查间隔（秒） |
+| `timeout` | ✅ | ✅ | ✅ | ✅ | 超时时间（秒） |
+| `maxretries` | ✅ | ✅ | ✅ | ✅ | 最大重试次数 |
+| `retryInterval` | ✅ | ✅ | ✅ | ✅ | 重试间隔（秒） |
+| `resendInterval` | ✅ | ✅ | ✅ | ✅ | 通知重发间隔 |
+| `ignoreTls` | ✅ | ✅ | ❌ | ❌ | 忽略 TLS 错误 |
+| `upsideDown` | ✅ | ✅ | ✅ | ✅ | 倒置模式 |
+| `expiryNotification` | ✅ | ✅ | ❌ | ❌ | 证书过期通知 |
+| `domainExpiryNotification` | ✅ | ✅ | ❌ | ❌ | 域名过期通知 |
+| `proxyId` | ✅ | ✅ | ❌ | ❌ | 代理ID |
+| `save_response` | ✅ | ✅ | ❌ | ❌ | 保存响应 |
+| `save_error_response` | ✅ | ✅ | ❌ | ❌ | 保存错误响应 |
+| `response_max_length` | ✅ | ✅ | ❌ | ❌ | 响应最大长度 |
+| `tags` | ✅ | ✅ | ✅ | ✅ | 标签列表 |
+| `notificationIDList` | ✅ | ✅ | ✅ | ✅ | 通知列表 |
+
+#### A.1.3 目标地址字段对比
+
+| 字段名 | HTTP | TCP | Ping | DNS | 说明 |
+|--------|------|-----|------|-----|------|
+| `url` | ✅ | ❌ | ❌ | ❌ | 完整 URL（含协议、域名、路径） |
+| `hostname` | ❌ | ✅ | ✅ | ✅ | 主机名/IP 地址 |
+| `port` | ❌ | ✅ | ❌ | ✅ | 端口号 |
+
+**边界判断依据**：
+- **HTTP 类型**：使用 `url` 存储完整目标地址，包含协议（http/https）、域名、端口、路径等信息
+- **TCP/Ping/DNS**：使用 `hostname` 存储主机名，其中 TCP 和 DNS 额外使用 `port` 字段
+- **前端判断逻辑**（EditMonitor.vue:182-203）：
+  ```vue
+  <div v-if="monitor.type === 'http' || monitor.type === 'keyword' || ...">
+      <input v-model="monitor.url" />
+  </div>
+  <div v-if="monitor.type === 'port' || monitor.type === 'ping' || monitor.type === 'dns'">
+      <input v-model="monitor.hostname" />
+  </div>
+  ```
+
+#### A.1.4 HTTP 类型专属字段
+
+| 字段名 | 类型 | 说明 | 代码位置 |
+|--------|------|------|---------|
+| `method` | string | HTTP 方法（GET/POST/PUT/DELETE/HEAD/PATCH/OPTIONS） | monitor.js:547 |
+| `headers` | JSON | 请求头 | monitor.js:549 |
+| `body` | string | 请求体 | monitor.js:527-542 |
+| `httpBodyEncoding` | string | 编码格式（json/form/xml） | server.js:908 |
+| `maxredirects` | integer | 最大重定向次数 | monitor.js:556 |
+| `accepted_statuscodes` | array | 接受的状态码列表 | server.js:875 |
+| `ipFamily` | string | IP 家族（ipv4/ipv6） | monitor.js:500-506 |
+| `cacheBust` | boolean | 缓存破坏（添加随机参数） | monitor.js:567-573 |
+
+**HTTP 子类型额外字段**：
+
+| 子类型 | 额外字段 | 说明 |
+|--------|---------|------|
+| `keyword` | `keyword`, `invertKeyword` | 关键词检查 |
+| `json-query` | `jsonPath`, `jsonPathOperator`, `expectedValue` | JSON 查询验证 |
+
+**HTTP 认证专属字段**：
+
+| 字段名 | 说明 | 代码位置 |
+|--------|------|---------|
+| `authMethod` | 认证方式（basic/oauth2-cc/ntlm/mtls） | server.js:893 |
+| `basic_auth_user` | 基础认证用户名 | monitor.js:474-478 |
+| `basic_auth_pass` | 基础认证密码 | monitor.js:474-478 |
+| `oauth_client_id` | OAuth2 客户端ID | monitor.js:483-498 |
+| `oauth_client_secret` | OAuth2 客户端密钥 | monitor.js:483-498 |
+| `oauth_token_url` | OAuth2 Token URL | monitor.js:483-498 |
+| `oauth_scopes` | OAuth2 作用域 | monitor.js:483-498 |
+| `oauth_audience` | OAuth2 Audience | monitor.js:483-498 |
+| `oauth_auth_method` | OAuth2 认证方法 | monitor.js:483-498 |
+| `tlsCa` | mTLS CA 证书 | monitor.js:603-613 |
+| `tlsCert` | mTLS 客户端证书 | monitor.js:603-613 |
+| `tlsKey` | mTLS 客户端密钥 | monitor.js:603-613 |
+| `authWorkstation` | NTLM 工作站 | server.js:894 |
+| `authDomain` | NTLM 域 | server.js:895 |
+
+**HTTP 类型边界代码**：
+```javascript
+// monitor.js:468
+if (this.type === "http" || this.type === "keyword" || this.type === "json-query") {
+    // HTTP 请求处理
+    let res = await this.makeAxiosRequest(options);
+}
+```
+
+#### A.1.5 TCP 类型专属字段
+
+| 字段名 | 类型 | 说明 | 代码位置 |
+|--------|------|------|---------|
+| `hostname` | string | 目标主机名 | tcp.js:127 |
+| `port` | integer | 目标端口 | tcp.js:127 |
+| `smtpSecurity` | string | 安全模式（secure/starttls/nostarttls） | tcp.js:138, 790-797 |
+| `expected_tls_alert` | string | 期望的 TLS 警报（mTLS 验证） | tcp.js:288-337 |
+
+**TCP 类型边界代码**：
+```javascript
+// 前端判断（EditMonitor.vue:688-717）
+<div v-if="monitor.type === 'port' || ..." class="my-3">
+    <input v-model="monitor.port" />
+</div>
+
+// TLS 安全模式选择（EditMonitor.vue:790-797）
+<div v-if="monitor.type === 'port'" class="my-3">
+    <select v-model="monitor.smtpSecurity">
+        <option value="nostarttls">None</option>
+        <option value="secure">SSL</option>
+        <option value="starttls">STARTTLS</option>
+    </select>
+</div>
+
+// 后端执行（monitor.js:905）
+else if (this.type in UptimeKumaServer.monitorTypeList) {
+    const monitorType = UptimeKumaServer.monitorTypeList[this.type];
+    await monitorType.check(this, bean, UptimeKumaServer.getInstance());
+}
+```
+
+**TCP 类型实现细节**：
+- 标准 TCP 检查：`tcping()` 函数使用 `tcp-ping` 库
+- TLS 证书检查：当 `smtpSecurity` 为 `secure` 或 `starttls` 时
+- mTLS 验证：当 `expected_tls_alert` 不为 `none` 时
+
+#### A.1.6 Ping 类型专属字段
+
+| 字段名 | 类型 | 说明 | 代码位置 |
+|--------|------|------|---------|
+| `hostname` | string | 目标主机名 | monitor.js:715 |
+| `packetSize` | integer | 数据包大小（默认 56 字节） | monitor.js:720, 1735-1739 |
+| `ping_count` | integer | 发送次数（默认 1 次） | monitor.js:716, 1751-1755 |
+| `ping_numeric` | boolean | 仅输出数字 IP | monitor.js:718 |
+| `ping_per_request_timeout` | integer | 每次请求超时（默认 2 秒） | monitor.js:721-722, 1741-1749 |
+
+**Ping 类型边界代码**：
+```javascript
+// 前端判断（EditMonitor.vue:474-508）
+<div v-if="monitor.type === 'port' || monitor.type === 'ping' || ...">
+    <input v-model="monitor.hostname" />
+</div>
+
+// 后端执行（monitor.js:714-726）
+else if (this.type === "ping") {
+    bean.ping = await ping(
+        this.hostname,
+        this.ping_count,
+        "",
+        this.ping_numeric,
+        this.packetSize,
+        this.timeout,
+        this.ping_per_request_timeout
+    );
+    bean.status = UP;
+}
+
+// 专属验证（monitor.js:1733-1772）
+if (this.type === "ping") {
+    if (this.packetSize && ...) {
+        throw new Error(`Packet size must be between...`);
+    }
+    if (this.ping_count && ...) {
+        throw new Error(`Echo requests count must be between...`);
+    }
+    // 全局超时必须大于单次超时
+    if (pingGlobalTimeout < this.ping_per_request_timeout) {
+        throw new Error(`Timeout must be greater than per-request timeout`);
+    }
+}
+```
+
+**Ping 类型验证规则**：
+| 参数 | 最小值 | 最大值 | 默认值 |
+|------|--------|--------|--------|
+| `packetSize` | 1 | 65500 | 56 |
+| `ping_count` | 1 | 100 | 1 |
+| `ping_per_request_timeout` | 1 | 3600 | 2 |
+| `timeout`（全局） | `ping_per_request_timeout` | 3600 | 20 |
+
+#### A.1.7 DNS 类型专属字段
+
+| 字段名 | 类型 | 说明 | 代码位置 |
+|--------|------|------|---------|
+| `hostname` | string | 要查询的主机名/域名 | dns.js:27 |
+| `dns_resolve_type` | string | 记录类型 | dns.js:27, 34-88 |
+| `dns_resolve_server` | string | DNS 解析服务器（逗号分隔） | dns.js:26, 117-164 |
+| `port` | integer | DNS 服务器端口（默认 53） | dns.js:27, 176 |
+| `conditions` | JSON | 条件表达式组 | dns.js:30-32, 39-87 |
+| `dns_last_result` | string | 最后一次查询结果（自动更新） | dns.js:90-92 |
+
+**支持的 DNS 记录类型**：
+| 类型 | 说明 | 条件检查方式 |
+|------|------|-------------|
+| `A` | IPv4 地址 | 任一记录匹配 |
+| `AAAA` | IPv6 地址 | 任一记录匹配 |
+| `PTR` | 反向解析 | 任一记录匹配 |
+| `TXT` | 文本记录 | 任一记录的任一部分匹配 |
+| `CNAME` | 别名 | 精确匹配 |
+| `CAA` | 证书颁发机构 | issue 字段 |
+| `MX` | 邮件交换 | exchange 字段 |
+| `NS` | 域名服务器 | 任一记录匹配 |
+| `SOA` | 起始授权 | nsname 字段 |
+| `SRV` | 服务定位 | name 字段 |
+
+**DNS 类型边界代码**：
+```javascript
+// 前端判断（EditMonitor.vue:912-972）
+<template v-if="monitor.type === 'dns'">
+    <input v-model="monitor.dns_resolve_server" />
+    <input v-model="monitor.port" />
+    <VueMultiselect v-model="monitor.dns_resolve_type" :options="dnsresolvetypeOptions" />
+</template>
+
+// 条件组件显示（EditMonitor.vue:1390-1395）
+<EditMonitorConditions
+    v-if="supportsConditions && conditionVariables.length > 0"
+    v-model="monitor.conditions"
+/>
+
+// 后端执行（dns.js:12-100）
+class DnsMonitorType extends MonitorType {
+    name = "dns";
+    supportsConditions = true;  // 支持条件判断
+    conditionVariables = [new ConditionVariable("record", defaultStringOperators)];
+    
+    async check(monitor, heartbeat, _server) {
+        // 1. 解析 DNS
+        let dnsRes = await this.dnsResolve(
+            monitor.hostname, 
+            resolverServers, 
+            monitor.port, 
+            monitor.dns_resolve_type
+        );
+        
+        // 2. 根据记录类型处理
+        switch (monitor.dns_resolve_type) {
+            case "A":
+            case "AAAA":
+            case "PTR":
+                conditionsResult = dnsRes.some((record) => handleConditions({ record }));
+                break;
+            case "MX":
+                conditionsResult = dnsRes.some((record) => handleConditions({ record: record.exchange }));
+                break;
+            // ... 其他类型
+        }
+        
+        // 3. 保存查询结果
+        await R.exec("UPDATE `monitor` SET dns_last_result = ? WHERE id = ? ", ...);
+        
+        if (!conditionsResult) {
+            throw new Error(dnsMessage);
+        }
+    }
+}
+```
+
+### A.2 四类监控类型字段对照表（汇总）
+
+| 字段名 | HTTP | TCP | Ping | DNS | 字段类型 | 说明 |
+|--------|------|-----|------|-----|---------|------|
+| `name` | ✅ | ✅ | ✅ | ✅ | string | 名称 |
+| `type` | ✅ http | ✅ port | ✅ ping | ✅ dns | string | 类型标识 |
+| `active` | ✅ | ✅ | ✅ | ✅ | boolean | 激活状态 |
+| `interval` | ✅ | ✅ | ✅ | ✅ | integer | 检查间隔 |
+| `timeout` | ✅ | ✅ | ✅ | ✅ | integer | 超时时间 |
+| `maxretries` | ✅ | ✅ | ✅ | ✅ | integer | 最大重试 |
+| `retryInterval` | ✅ | ✅ | ✅ | ✅ | integer | 重试间隔 |
+| `url` | ✅ | ❌ | ❌ | ❌ | string | 目标 URL |
+| `hostname` | ❌ | ✅ | ✅ | ✅ | string | 主机名 |
+| `port` | ❌ | ✅ | ❌ | ✅ | integer | 端口号 |
+| `method` | ✅ | ❌ | ❌ | ❌ | string | HTTP 方法 |
+| `headers` | ✅ | ❌ | ❌ | ❌ | JSON | 请求头 |
+| `body` | ✅ | ❌ | ❌ | ❌ | string | 请求体 |
+| `httpBodyEncoding` | ✅ | ❌ | ❌ | ❌ | string | 编码格式 |
+| `maxredirects` | ✅ | ❌ | ❌ | ❌ | integer | 最大重定向 |
+| `accepted_statuscodes` | ✅ | ❌ | ❌ | ❌ | array | 接受状态码 |
+| `ipFamily` | ✅ | ❌ | ❌ | ❌ | string | IP 家族 |
+| `cacheBust` | ✅ | ❌ | ❌ | ❌ | boolean | 缓存破坏 |
+| `keyword` | ⚠️ keyword | ❌ | ❌ | ❌ | string | 关键词 |
+| `invertKeyword` | ⚠️ keyword | ❌ | ❌ | ❌ | boolean | 反转关键词 |
+| `jsonPath` | ⚠️ json-query | ❌ | ❌ | ❌ | string | JSON 路径 |
+| `jsonPathOperator` | ⚠️ json-query | ❌ | ❌ | ❌ | string | 操作符 |
+| `expectedValue` | ⚠️ json-query | ❌ | ❌ | ❌ | string | 期望值 |
+| `authMethod` | ✅ | ❌ | ❌ | ❌ | string | 认证方式 |
+| `basic_auth_user` | ✅ | ❌ | ❌ | ❌ | string | 基础认证用户名 |
+| `basic_auth_pass` | ✅ | ❌ | ❌ | ❌ | string | 基础认证密码 |
+| `oauth_client_id` | ✅ | ❌ | ❌ | ❌ | string | OAuth2 客户端ID |
+| `oauth_client_secret` | ✅ | ❌ | ❌ | ❌ | string | OAuth2 客户端密钥 |
+| `oauth_token_url` | ✅ | ❌ | ❌ | ❌ | string | OAuth2 Token URL |
+| `oauth_scopes` | ✅ | ❌ | ❌ | ❌ | string | OAuth2 作用域 |
+| `oauth_audience` | ✅ | ❌ | ❌ | ❌ | string | OAuth2 Audience |
+| `tlsCa` | ✅ | ❌ | ❌ | ❌ | string | mTLS CA 证书 |
+| `tlsCert` | ✅ | ❌ | ❌ | ❌ | string | mTLS 客户端证书 |
+| `tlsKey` | ✅ | ❌ | ❌ | ❌ | string | mTLS 客户端密钥 |
+| `smtpSecurity` | ❌ | ✅ | ❌ | ❌ | string | TLS 安全模式 |
+| `expected_tls_alert` | ❌ | ✅ | ❌ | ❌ | string | 期望 TLS 警报 |
+| `packetSize` | ❌ | ❌ | ✅ | ❌ | integer | 数据包大小 |
+| `ping_count` | ❌ | ❌ | ✅ | ❌ | integer | 发送次数 |
+| `ping_numeric` | ❌ | ❌ | ✅ | ❌ | boolean | 仅数字 IP |
+| `ping_per_request_timeout` | ❌ | ❌ | ✅ | ❌ | integer | 单次超时 |
+| `dns_resolve_type` | ❌ | ❌ | ❌ | ✅ | string | 记录类型 |
+| `dns_resolve_server` | ❌ | ❌ | ❌ | ✅ | string | DNS 服务器 |
+| `conditions` | ❌ | ❌ | ❌ | ✅ | JSON | 条件表达式 |
+| `ignoreTls` | ✅ | ✅ | ❌ | ❌ | boolean | 忽略 TLS 错误 |
+| `expiryNotification` | ✅ | ✅ | ❌ | ❌ | boolean | 证书过期通知 |
+| `proxyId` | ✅ | ✅ | ❌ | ❌ | integer | 代理ID |
+| `save_response` | ✅ | ✅ | ❌ | ❌ | boolean | 保存响应 |
+| `save_error_response` | ✅ | ✅ | ❌ | ❌ | boolean | 保存错误响应 |
+| `response_max_length` | ✅ | ✅ | ❌ | ❌ | integer | 响应最大长度 |
+
+### A.3 字段边界判断依据总结
+
+#### A.3.1 前端边界判断
+
+前端通过 `monitor.type` 字段决定显示哪些表单组件：
+
+```javascript
+// EditMonitor.vue 中的关键条件判断
+// 通用字段 - 始终显示
+name, type, interval, timeout, maxretries, ...
+
+// HTTP 系专属
+if (monitor.type === 'http' || 'keyword' || 'json-query' || 'real-browser') {
+    url, method, headers, body, maxredirects, accepted_statuscodes, ...
+}
+
+// TCP/Ping/DNS 共享 hostname
+if (monitor.type === 'port' || 'ping' || 'dns' || ...) {
+    hostname
+}
+
+// TCP 专属
+if (monitor.type === 'port') {
+    port, smtpSecurity, expected_tls_alert
+}
+
+// Ping 专属高级选项（无特定条件，与 hostname 共享显示）
+packetSize, ping_count, ping_numeric, ping_per_request_timeout
+
+// DNS 专属
+if (monitor.type === 'dns') {
+    dns_resolve_server, port, dns_resolve_type, conditions
+}
+
+// 条件组件（DNS 等支持条件的类型）
+if (supportsConditions && conditionVariables.length > 0) {
+    conditions
+}
+```
+
+#### A.3.2 后端边界判断
+
+后端在不同阶段有不同的边界判断逻辑：
+
+**1. 保存阶段（server.js）**
+- 使用 `bean.import(monitor)` 导入大部分字段
+- 特殊字段映射：`camelCase` → `snake_case`
+- JSON 字段序列化
+
+**2. 验证阶段（monitor.js:validate()）**
+```javascript
+// Ping 专属验证
+if (this.type === "ping") {
+    // packetSize, ping_count, ping_per_request_timeout 验证
+}
+
+// HTTP 相关验证无特定 type 条件（通用 JSON 验证）
+if (this.headers) {
+    try { JSON.parse(this.headers); } catch (e) { ... }
+}
+```
+
+**3. 执行阶段（monitor.js:start()/beat()）**
+```javascript
+// 内联实现（HTTP、Ping）
+if (this.type === "http" || "keyword" || "json-query") {
+    // Axios HTTP 请求
+}
+else if (this.type === "ping") {
+    // ping() 函数调用
+}
+// 类继承实现（TCP、DNS）
+else if (this.type in UptimeKumaServer.monitorTypeList) {
+    const monitorType = UptimeKumaServer.monitorTypeList[this.type];
+    await monitorType.check(this, bean, server);
+}
+```
+
+---
+
 ## 三、前端表单配置到后端执行的映射机制
 
 ### 3.1 数据流概览
