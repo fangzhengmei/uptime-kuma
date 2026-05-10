@@ -432,16 +432,40 @@ static async getSettings(type) {
 | 标准 JSON 值 | 成功 | 解析后的值 | ❌ 否（本来就不缓存） |
 | 非 JSON 值（如 jwtSecret） | 失败 | 原始字符串 | ❌ 否 |
 
-**jwtSecret 的特殊性：`jwtSecret` 没有 `type` 列的值（`initJWTSecret` 写入时没有设置 `bean.type）
+### 3.6.1 jwtSecret 与 getSettings 的兼容性问题（重要！）
+
+**jwtSecret 的 type 列值**：
 
 ```javascript
 // initJWTSecret 中：
 jwtSecretBean.key = "jwtSecret";
-// 没有设置 jwtSecretBean.type → type 为 null 或 undefined
+// 没有设置 jwtSecretBean.type → type 为 null
 jwtSecretBean.value = ...
 ```
 
-所以 `jwtSecret` **不会**被 `getSettings()` 返回，除非查询时 `type` 为 null。
+**SQL 中 NULL 比较的特性**：
+- SQL 标准：`NULL = NULL` 返回 `NULL`（即 false）
+- 正确的 NULL 比较应该是 `WHERE type IS NULL`
+- 但代码使用的是 `WHERE type = ?`
+
+**getSettings(type) 的实际查询**：
+```sql
+SELECT `key`, `value` FROM setting WHERE `type` = ? 
+```
+
+**最终结论**：
+
+| 调用方式 | SQL 参数 | 匹配的记录 | jwtSecret 是否返回 |
+|---------|---------|-----------|-------------------|
+| `getSettings("general")` | `"general"` | type = "general" 的记录 | ❌ 否 |
+| `getSettings(null)` | `NULL` | type = NULL 的记录 | ❌ **否**（NULL = NULL 为 false） |
+| `getSettings(undefined)` | `NULL` | type = NULL 的记录 | ❌ **否**（同上） |
+
+**关键发现**：
+- `jwtSecret` 的 `type = null`
+- 无论用什么参数调用 `getSettings(type)`，都**不会**返回 `jwtSecret`
+- 这是因为 SQL `NULL = NULL` 不匹配，而代码没有使用 `IS NULL` 语法
+- 实际上，`jwtSecret` 只能通过 `Settings.get("jwtSecret")` 或直接 `R.findOne()` 读取
 
 ### 3.7 读取路径 Z：直接数据库操作（完全绕过 Settings API
 
@@ -572,11 +596,19 @@ static deleteCache(keyList) {
 
 假设数据库中 `jwtSecret` 的值为：`"$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"`（原始 bcrypt hash，没有 JSON 引号）
 
-| 读取方式 | 代码 | 返回值 | 类型 | 是否可用 |
-|---------|------|--------|------|---------|
-| 路径 X（Settings.get） | `Settings.get("jwtSecret")` | `"$2a$10$..."` | 字符串 | ✅ 可用（但不缓存） |
-| 路径 Y（getSettings） | `getSettings("...")` | `"$2a$10$..."` | 字符串 | ✅ 可用（但 type 为 null） |
-| 路径 Z（R.findOne） | `R.findOne(...).value` | `"$2a$10$..."` | 字符串 | ✅ 可用（实际使用路径） |
+**重要前提**：`jwtSecret` 的 `type = null`，而 SQL 中 `NULL = NULL` 为 false，所以 `getSettings()` 根本不会返回 `jwtSecret`。
+
+| 读取方式 | 代码 | 返回值 | 类型 | 是否可用 | 说明 |
+|---------|------|--------|------|---------|------|
+| 路径 X（Settings.get） | `Settings.get("jwtSecret")` | `"$2a$10$..."` | 字符串 | ✅ 可用 | 直接按 key 查询，不依赖 type；但 JSON.parse 失败，**不缓存** |
+| 路径 Y（getSettings） | `getSettings(...)` | `undefined` / `null` | 无 | ❌ **不可用** | `jwtSecret.type = null`，SQL `NULL = NULL` 为 false，**不会被返回** |
+| 路径 Z（R.findOne） | `R.findOne(...).value` | `"$2a$10$..."` | 字符串 | ✅ 可用 | 实际使用路径，直接按 key 查询，不经过 Settings API |
+
+**关键澄清**：
+- `getSettings(type)` 只能返回 `type` 列精确匹配的记录
+- `jwtSecret.type = null`，但 SQL `NULL = NULL` 返回 false
+- 所以无论传入什么参数（包括 `null`），`getSettings()` 都**不会**返回 `jwtSecret`
+- 如果想返回 type 为 null 的记录，需要修改 SQL 为 `WHERE type IS NULL`，但代码没有这样做
 
 #### 场景 2：如果有人错误地用 Settings.set("jwtSecret", ...) 写入
 
@@ -588,15 +620,19 @@ await Settings.set("jwtSecret", "$2a$10$N9qo8uLO...");
 "\"$2a$10$N9qo8uLO...\""  // 带 JSON 引号！
 ```
 
-此时各读取路径的行为：
+此时各读取路径的行为（注意：`Settings.set()` 的默认 `type = null`，所以同样存在 SQL `NULL = NULL` 问题）：
 
-| 读取方式 | 返回值 | 是否可用 |
-|---------|--------|---------|
-| 路径 X（Settings.get） | `"$2a$10$..."`（解析后） | ✅ 可用（被缓存） |
-| 路径 Y（getSettings） | `"$2a$10$..."`（解析后） | ✅ 可用 |
-| 路径 Z（R.findOne.value） | `"\"$2a$10$N9qo8uLO...\""`（带引号的字符串！） | ❌ **不可用！** |
+| 读取方式 | 返回值 | 是否可用 | 说明 |
+|---------|--------|---------|------|
+| 路径 X（Settings.get） | `"$2a$10$..."`（解析后） | ✅ 可用（被缓存） | JSON.parse 成功，**会被缓存** |
+| 路径 Y（getSettings） | `undefined` / `null` | ❌ **不可用** | `type = null`，SQL `NULL = NULL` 为 false，**不会被返回** |
+| 路径 Z（R.findOne.value） | `"\"$2a$10$N9qo8uLO...\""`（带引号的字符串！） | ❌ **不可用！** | 实际代码使用路径 Z 读取，会得到带引号的字符串，JWT 验证会失败 |
 
-**关键风险**：实际代码使用路径 Z 读取，会得到带引号的字符串，JWT 验证会失败！
+**关键风险**：
+- 实际代码使用路径 Z（`R.findOne().value`）读取 `jwtSecret`
+- 如果有人用 `Settings.set("jwtSecret", ...)` 错误写入，值会被 `JSON.stringify()` 序列化
+- 路径 Z 不会进行 `JSON.parse()`，所以会得到带引号的字符串
+- JWT 验证会失败，导致所有认证功能失效
 
 #### 场景 3：缓存不一致问题
 
@@ -708,10 +744,72 @@ T3: Settings.get("checkUpdate") → 未命中缓存 → 重新读取 → 正确
 |------|------|
 | 是否存在非 JSON 写入路径？ | ✅ 是，`initJWTSecret()` 是唯一明确的直接写入路径 |
 | "全量 JSON 写入"是否正确？ | ❌ 不正确，需要修正为"标准路径 JSON 序列化，特殊路径原始写入" |
+| `JSON.stringify(undefined)` 返回什么？ | 返回 `undefined` 本身，不是字符串 `"undefined"` |
+| `Settings.set(key, undefined)` 落库吗？ | 落库为 `NULL`，读取时 `JSON.parse(null)` 返回 `null` |
 | jwtSecret 如何读取？ | 通过路径 Z（`R.findOne().value`），完全绕过 Settings API |
 | jwtSecret 用 Settings.get() 读会怎样？ | 返回正确值，但不会缓存（因为 JSON.parse 失败） |
+| getSettings() 能读取 jwtSecret 吗？ | ❌ 不能，因为 SQL `NULL = NULL` 为 false，不会匹配 type = null 的记录 |
+| getSettings(null) 能读取 type 为 null 的记录吗？ | ❌ 不能，SQL 标准中 `NULL = NULL` 返回 `NULL`（false） |
 | initJWTSecret() 会清缓存吗？ | ❌ 不会，但 jwtSecret 本来就不被缓存，所以没问题 |
 | 历史遗留值存在吗？ | ✅ 可能存在（1.X 数据、迁移脚本直接操作） |
+
+### 3.12 最终一致口径（避免歧义的统一结论）
+
+#### 适用前提：
+1. **标准记录**：所有通过 `Settings.set()` 或 `Settings.setSettings()` 写入的记录，`type` 列有明确的字符串值（如 `"general"`、`"statusPage"` 等）
+2. **特殊记录**：`jwtSecret` 等通过 `initJWTSecret()` 或直接 SQL 写入的记录，`type` 列为 `NULL`
+
+---
+
+#### 核心规则（无歧义）：
+
+##### 规则 1：按 key 读取（Settings.get()、R.findOne()）
+- **标准记录**：按 key 查询，不依赖 `type` 列，始终可读取
+- **特殊记录**：按 key 查询，不依赖 `type` 列，始终可读取
+- **无歧义**：`Settings.get("jwtSecret")` 一定能读取到值
+
+##### 规则 2：按 type 批量读取（Settings.getSettings(type)）
+- **SQL 查询**：`SELECT key, value FROM setting WHERE type = ?`
+- **SQL 标准**：`NULL = NULL` 返回 `NULL`（即 false）
+- **标准记录（type = "general"）**：`getSettings("general")` 可读取
+- **特殊记录（type = NULL）**：`getSettings(null)` **不可读取**（因为 `NULL = NULL` 为 false）
+- **无歧义**：`getSettings()` 永远不会返回 `jwtSecret`
+
+##### 规则 3：type 列的语义
+- **type = 明确字符串**：表示该设置属于某个功能模块（如 `"general"`、`"statusPage"`）
+- **type = NULL**：表示该设置是特殊遗留值或通过非标准路径写入
+- **无歧义**：`type` 不是主键的一部分，不影响按 key 查询
+
+---
+
+#### 例外情况（需要特别注意）：
+
+##### 例外 1：Settings.set(key, value, type = null)
+- `Settings.set()` 的默认参数是 `type = null`
+- 所以 `Settings.set("myKey", "myValue")` 会写入 `type = NULL`
+- 这样的记录**会被** `Settings.get("myKey")` 读取到
+- 这样的记录**不会被** `getSettings(null)` 读取到（SQL `NULL = NULL` 问题）
+- **风险**：如果开发者忘记传 `type` 参数，记录会变成"不可通过 getSettings 读取"
+
+##### 例外 2：JSON.stringify(undefined)
+- `JSON.stringify(undefined)` 返回 `undefined` 本身（不是字符串 `"undefined"`）
+- 所以 `Settings.set(key, undefined)` 会写入 `value = NULL`
+- 读取时 `JSON.parse(null)` 成功解析为 `null`
+- **无歧义**：`undefined` 会落库为 `NULL`，读取时返回 `null`
+
+##### 例外 3：jwtSecret 的特殊读写路径
+- 写入：`initJWTSecret()` → 直接 `bean.value = ...`（不 JSON 序列化）
+- 读取：`R.findOne("setting", ...).value`（不 JSON.parse，不经过 Settings API）
+- **无歧义**：如果有人用 `Settings.set("jwtSecret", ...)` 错误写入，值会被 JSON 序列化，导致 JWT 验证失败
+
+---
+
+#### 消除歧义的记忆口诀：
+
+1. **按 key 读：万能钥匙**（始终可用，不管 type）
+2. **按 type 读：精确匹配**（`NULL` 无法匹配 `NULL`）
+3. **特殊记录：jwtSecret**（只能按 key 读，不能按 type 读）
+4. **标准记录：双路径可读**（既能按 key 读，也能按 type 读）
 
 ---
 
@@ -1376,4 +1474,9 @@ let mariadbPoolConfig = {
 ---
 
 **报告生成日期**：2026-05-10
-**报告版本**：3.0（重大修订：修正全量 JSON 写入结论，补充直接写入路径分析，深入分析非标准值的兼容影响）
+**报告版本**：5.0（最终修订：统一批量读取路径与密钥项的可见性结论，消除文内冲突，补充完整的最终一致口径）
+- **版本 1.0**：基础分析，包含 setup 流程、迁移机制、聚合迁移
+- **版本 2.0**：澄清 setup 流程真实分支，修正 setting 缓存条件，深入聚合迁移风险
+- **版本 3.0**：发现 initJWTSecret 直接写入路径，分析非标准值的读取和缓存行为
+- **版本 4.0**：修正 JSON.stringify(undefined) 结论（返回 undefined 而非字符串 "undefined"），分析 SQL NULL = NULL 不匹配导致 getSettings 无法返回 jwtSecret 的问题
+- **版本 5.0**：统一批量读取路径（getSettings）与密钥项（jwtSecret）在 type 为空时的可见性结论，明确 SQL NULL = NULL 陷阱，补充完整的最终一致口径（适用前提、核心规则、例外情况、记忆口诀），消除文内所有"可读/不可读"的前后冲突
