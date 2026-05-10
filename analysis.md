@@ -488,7 +488,227 @@ async toPublicJSON(showTags = false, certExpiry = false) {
    - RSS 订阅正常工作
    - 状态徽章可嵌入外部网站
 
-### 5.5 相关未实现功能
+### 5.5 `published=0` 在真实系统中的触发路径
+
+经过代码分析，`published=0` 状态在真实系统中可能通过以下路径出现：
+
+#### 5.5.1 路径 1：数据库迁移（从旧版本升级）
+
+**触发条件**：从 Uptime Kuma 1.13.0 之前的版本升级
+
+**代码路径**：`server/database.js:610-666` 的 `migrateNewStatusPage()` 方法
+
+```javascript
+statusPage.published = !!(await setting("statusPagePublished"));
+```
+
+**关键点**：
+- 旧版本使用 `setting` 表存储状态页配置，包含 `statusPagePublished` 设置
+- 迁移时从旧设置继承 `published` 字段值
+- 如果旧版本中 `statusPagePublished = false`，迁移后 `status_page.published = 0`
+- 迁移只执行一次（检查 `slug = 'default'` 是否已存在）
+
+#### 5.5.2 路径 2：手工修改数据库
+
+**触发条件**：管理员直接操作数据库
+
+**常见操作**：
+```sql
+UPDATE status_page SET published = 0 WHERE slug = 'my-page';
+```
+
+**关键点**：
+- 数据库有 `published` 字段，允许直接修改
+- 没有 UI 界面可以修改此字段（保存时被注释掉）
+- 管理员可能通过数据库管理工具（如 SQLite Browser、phpMyAdmin）修改
+
+#### 5.5.3 路径 3：数据库导入/恢复
+
+**触发条件**：从包含 `published=0` 的数据库备份恢复
+
+**关键点**：
+- 如果备份文件中的状态页记录有 `published=0`
+- 恢复后该值会被保留
+- 没有导入后的校验或修正逻辑
+
+#### 5.5.4 路径 4：第三方脚本/API 操作
+
+**触发条件**：通过自定义脚本直接写入数据库
+
+**关键点**：
+- 可能使用 ORM（RedBean）直接操作 `status_page` bean
+- 可能使用原始 SQL 执行 UPDATE
+- 绕过了正常的保存流程（`saveStatusPage` 事件）
+
+### 5.6 后台保存对 `published` 字段的影响
+
+#### 5.6.1 状态页保存流程
+
+**代码路径**：`server/socket-handlers/status-page-socket-handler.js:292-433`
+
+```javascript
+socket.on("saveStatusPage", async (slug, config, publicGroupList, callback) => {
+    // ...
+    // statusPage.published = !!config.published;        // 第 329 行：被注释掉！
+    // statusPage.search_engine_index = !!config.search_engine_index;  // 第 330 行：被注释掉！
+    // statusPage.password = config.password;           // 第 331 行：被注释掉！
+    // ...
+    await R.store(statusPage);
+});
+```
+
+#### 5.6.2 保存行为分析
+
+| 字段 | 保存时是否更新 | 注释状态 |
+|------|--------------|---------|
+| `title` | ✅ 更新 | 正常代码 |
+| `description` | ✅ 更新 | 正常代码 |
+| `theme` | ✅ 更新 | 正常代码 |
+| `published` | ❌ 不更新 | 第 329 行被注释 |
+| `search_engine_index` | ❌ 不更新 | 第 330 行被注释 |
+| `password` | ❌ 不更新 | 第 331 行被注释 |
+
+**关键发现**：
+- 通过后台 UI 保存状态页时，`published` 字段**不会被修改**
+- 如果状态页已经是 `published=0`，保存后**仍然是** `published=0`
+- 后台保存不会"修复"或"重置"这个字段
+- 这意味着 `published=0` 一旦设置，会**永久保留**，除非直接操作数据库
+
+#### 5.6.3 新增状态页的默认值
+
+**代码路径**：`server/socket-handlers/status-page-socket-handler.js:436-464`
+
+```javascript
+socket.on("addStatusPage", async (title, slug, callback) => {
+    let statusPage = R.dispense("status_page");
+    statusPage.slug = slug;
+    statusPage.title = title;
+    statusPage.theme = "auto";
+    statusPage.icon = "";
+    statusPage.autoRefreshInterval = 300;
+    // 没有显式设置 published，使用数据库默认值
+    await R.store(statusPage);
+});
+```
+
+**关键点**：
+- 新增状态页时**没有显式设置** `published` 字段
+- 依赖数据库表定义的默认值：`DEFAULT 1`
+- 所以新增状态页默认是 `published=1`
+
+### 5.7 未登录可见边界的实际风险评估
+
+#### 5.7.1 风险等级评估框架
+
+我们从以下维度评估风险：
+
+| 维度 | 说明 |
+|------|------|
+| **触发概率** | `published=0` 在真实环境中出现的可能性 |
+| **数据暴露范围** | 未登录用户可以访问的数据量 |
+| **攻击前置条件** | 攻击者需要了解或猜测什么信息 |
+| **利用难度** | 攻击的技术门槛 |
+
+#### 5.7.2 各触发路径的风险评估
+
+##### 路径 1：数据库迁移
+
+**风险分析**：
+- **触发概率**：低
+  - 只有从 1.13.0 之前版本升级的用户会遇到
+  - 且旧版本中 `statusPagePublished` 需要是 `false`
+  - 大多数用户使用默认设置（`true`）
+- **数据暴露范围**：高
+  - 所有公开分组的监控数据完全暴露
+  - 心跳数据、事件历史、RSS、徽章都可访问
+- **攻击前置条件**：
+  1. 必须知道或猜测状态页的 `slug`
+  2. 默认状态页的 slug 是 `default`（容易猜测）
+  3. 其他状态页的 slug 需要枚举或获取
+- **利用难度**：极低
+  - 只需发送标准 HTTP 请求
+  - 不需要任何认证或特殊工具
+
+**风险等级**：⭐⭐⭐⭐（中高风险）
+
+##### 路径 2：手工修改数据库
+
+**风险分析**：
+- **触发概率**：中
+  - 管理员可能为了"隐藏"状态页而手工修改数据库
+  - 误以为设置 `published=0` 可以保护数据
+- **数据暴露范围**：高（与路径 1 相同）
+- **攻击前置条件**：
+  1. 必须知道 slug
+  2. 如果管理员为了隐藏而设置了特殊 slug，可能降低风险
+- **利用难度**：极低
+
+**关键矛盾**：
+- 管理员**意图**：隐藏状态页
+- **实际效果**：数据仍然完全可访问
+- **风险放大**：管理员可能产生虚假安全感，反而将敏感监控添加到公开分组
+
+**风险等级**：⭐⭐⭐⭐⭐（高风险）
+
+##### 路径 3：数据库导入/恢复
+
+**风险分析**：
+- **触发概率**：低到中
+  - 取决于备份文件的来源
+  - 如果备份来自旧版本或被篡改的数据库，风险增加
+- **数据暴露范围**：高
+- **攻击前置条件**：知道 slug
+- **利用难度**：极低
+
+**风险等级**：⭐⭐⭐（中风险）
+
+##### 路径 4：第三方脚本/API
+
+**风险分析**：
+- **触发概率**：低
+  - 只有自定义部署才会使用
+  - 需要刻意操作
+- **数据暴露范围**：高
+- **攻击前置条件**：知道 slug
+- **利用难度**：极低
+
+**风险等级**：⭐⭐⭐（中风险）
+
+#### 5.7.3 综合风险评估
+
+**整体风险等级**：⭐⭐⭐⭐（中高风险）
+
+**核心问题**：
+
+1. **虚假安全感**：
+   - 数据库有 `published` 字段，暗示存在访问控制
+   - 代码注释声称心跳 API "Can fetch only if published"
+   - 前端有 `isPublished` 计算属性
+   - 但实际**没有任何校验**
+
+2. **管理员预期与实际行为不一致**：
+   - 预期：`published=0` 应该隐藏状态页
+   - 实际：数据完全可访问
+   - 后果：管理员可能将敏感监控添加到公开分组
+
+3. **默认状态页 slug 是 `default`**：
+   - 非常容易猜测
+   - 攻击者可以尝试 `/status/default`
+   - 如果 `published=0`，所有数据立即暴露
+
+#### 5.7.4 风险缓解建议
+
+**立即缓解**：
+1. **不要依赖 `published` 字段**：这是当前最有效的缓解方式
+2. **通过分组控制**：不希望公开的监控，不要添加到公开分组
+3. **检查数据库**：执行 `SELECT slug, published FROM status_page;` 确认所有状态页的 `published` 状态
+
+**长期修复（需要代码修改）**：
+1. 在所有公开端点添加 `published=1` 校验
+2. 或者完全移除 `published` 字段，避免混淆
+3. 实现真正的密码保护功能
+
+### 5.8 相关未实现功能
 
 除了 `published` 字段外，`status_page` 表还有其他字段也未完全实现：
 
@@ -508,18 +728,21 @@ async toPublicJSON(showTags = false, certExpiry = false) {
 | 监控公开 JSON | `server/model/monitor.js` | 85-108 |
 | 心跳公开 JSON | `server/model/heartbeat.js` | 19-26 |
 | 分组公开 JSON | `server/model/group.js` | 13-27 |
+| 状态页路由（所有公开端点） | `server/routers/status-page-router.js` | 1-264 |
 | 心跳数据 API | `server/routers/status-page-router.js` | 64-110 |
 | 状态页数据 API | `server/routers/status-page-router.js` | 39-60 |
-| 保存状态页 | `server/socket-handlers/status-page-socket-handler.js` | 292-433 |
+| 保存状态页（published 被注释） | `server/socket-handlers/status-page-socket-handler.js` | 292-433 |
 | 数据清理任务 | `server/jobs/clear-old-data.js` | 13-60 |
 | 可用率计算器 | `server/uptime-calculator.js` | 1-150 |
 | 前端公开数据混入 | `src/mixins/public.js` | 1-55 |
 | 公开分组列表组件 | `src/components/PublicGroupList.vue` | 1-408 |
-| 状态页前端 | `src/pages/StatusPage.vue` | 1-1100+ |
+| 状态页前端（isPublished 未使用） | `src/pages/StatusPage.vue` | 772-774 |
 
 ---
 
-## 6. 总结
+## 7. 总结
+
+### 7.1 已实现的安全机制
 
 Uptime Kuma 的公开状态页设计采用了**多层裁剪和隔离机制**：
 
@@ -530,4 +753,29 @@ Uptime Kuma 的公开状态页设计采用了**多层裁剪和隔离机制**：
 5. **认证分离**：公开 API 和私有 API 完全分离
 6. **缓存保护**：公开数据使用缓存，减少数据库压力
 
-这些机制确保了未登录用户只能看到必要的信息，同时保护了系统的敏感数据和用户隐私。
+### 7.2 发现的问题
+
+经过深入分析，发现了以下重要问题：
+
+1. **`published` 字段形同虚设**：
+   - 所有公开 API 端点都没有校验 `published` 字段
+   - 仅按 `slug` 查询，未发布的状态页仍然完全可访问
+   - 注释与代码不一致（`status-page-router.js:63` 声称 "Can fetch only if published"）
+
+2. **相关功能未实现**：
+   - `search_engine_index`：数据库字段存在，但无实际逻辑
+   - `password`：数据库字段存在，但无密码保护逻辑
+   - `isPublished`：前端计算属性定义了，但未被使用
+
+3. **对公开数据边界的影响**：
+   - 管理员设置 `published=0` 无法隐藏状态页
+   - 唯一真正有效的隐私控制是：不将监控添加到公开分组
+   - 存在数据泄露风险：隐藏状态页可通过 slug 枚举访问
+
+### 7.3 结论
+
+Uptime Kuma 的公开数据保护主要依赖于**分组的公开性**（`group.public` 字段），而不是状态页的发布态（`status_page.published`）。这意味着：
+
+- 如果不希望数据被公开，**不要将监控添加到公开分组**
+- 仅设置 `published=0` **无法阻止未登录用户访问数据**
+- 这是一个需要注意的设计特性（或潜在 bug）
