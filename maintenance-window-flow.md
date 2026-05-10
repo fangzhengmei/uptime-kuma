@@ -380,18 +380,160 @@ static async getMaintenanceList(statusPageId) {
 
 ### 5.2 状态页展示逻辑
 
-前端状态页在 `StatusPage.vue` 中展示维护状态：
+前端状态页在 `StatusPage.vue` 中展示维护状态。状态页的维护相关展示分为**两个独立机制**：
 
-#### 5.2.1 整体状态判断
+---
+
+### 5.2.1 整体状态计算机制
+
+整体状态由 `overallStatus()` 计算属性决定（`StatusPage.vue:793-818`）：
 
 ```javascript
-// StatusPage.vue:832-834
-isMaintenance() {
-    return this.overallStatus === STATUS_PAGE_MAINTENANCE;
+overallStatus() {
+    if (Object.keys(this.$root.publicLastHeartbeatList).length === 0) {
+        return -1;
+    }
+
+    let status = STATUS_PAGE_ALL_UP;
+    let hasUp = false;
+
+    for (let id in this.$root.publicLastHeartbeatList) {
+        let beat = this.$root.publicLastHeartbeatList[id];
+
+        if (beat.status === MAINTENANCE) {
+            return STATUS_PAGE_MAINTENANCE;  // ⚠️ 立即返回！
+        } else if (beat.status === UP) {
+            hasUp = true;
+        } else {
+            status = STATUS_PAGE_PARTIAL_DOWN;
+        }
+    }
+
+    if (!hasUp) {
+        status = STATUS_PAGE_ALL_DOWN;
+    }
+
+    return status;
 }
 ```
 
-#### 5.2.2 维护告警展示
+#### 核心逻辑分析：优先级判定
+
+| 优先级 | 状态常量（数值） | 触发条件 | 判定顺序 |
+|--------|------------------|----------|----------|
+| **1（最高）** | `STATUS_PAGE_MAINTENANCE` (3) | 任意监控的 `beat.status === MAINTENANCE` | 循环中**第一个条件**，一旦命中立即 `return` 退出循环 |
+| 2 | `STATUS_PAGE_ALL_DOWN` (0) | 所有监控都是 DOWN/PENDING，**且循环中未命中 MAINTENANCE** | 循环结束后检查 `hasUp` |
+| 3 | `STATUS_PAGE_PARTIAL_DOWN` (2) | 至少一个 UP，至少一个 DOWN/PENDING，**且循环中未命中 MAINTENANCE** | 循环中 `else` 分支累积 |
+| 4（最低） | `STATUS_PAGE_ALL_UP` (1) | 所有监控都是 UP，**且循环中未命中 MAINTENANCE** | 默认值 |
+
+#### 边界条件说明
+
+**条件 1：MAINTENANCE 是短路返回**
+- 代码结构：`for...in` 循环中 `if (MAINTENANCE) return`
+- 行为：**只要有任何一个监控的心跳状态是 MAINTENANCE，整个循环立即终止**
+- 后续监控的 UP/DOWN 状态**完全不会被检查**
+
+**条件 2：模板中的展示顺序不等于优先级**
+
+模板代码（`StatusPage.vue:385-409`）：
+```vue
+<div v-if="allUp">
+    {{ $t("All Systems Operational") }}
+</div>
+<div v-else-if="partialDown">
+    {{ $t("Partially Degraded Service") }}
+</div>
+<div v-else-if="allDown">
+    {{ $t("Degraded Service") }}
+</div>
+<div v-else-if="isMaintenance">
+    {{ $t("maintenanceStatus-under-maintenance") }}
+</div>
+```
+
+**关键点：** 模板中的 `v-if/v-else-if` 顺序是 `allUp → partialDown → allDown → isMaintenance`，但这只是 UI 展示顺序。
+
+**实际优先级由 `overallStatus()` 的返回值决定**：
+- `isMaintenance()` 检查 `overallStatus === STATUS_PAGE_MAINTENANCE`
+- 由于 `overallStatus()` 中 MAINTENANCE 是最高优先级，一旦命中就立即返回
+- 因此**不会出现「维护中但显示故障」的情况**
+
+**条件 3：维护期间无法看到实际故障**
+
+由于维护中的监控心跳状态已是 `MAINTENANCE`（值为 3），而非实际的 `UP`（1）或 `DOWN`（0）：
+- 状态页无法从心跳数据中知道这些监控在维护期间的实际状态
+- 即使服务在维护期间故障，心跳记录也是 `MAINTENANCE`
+- 因此 `overallStatus()` 只能看到 `MAINTENANCE`，无法看到隐藏的 `DOWN`
+
+---
+
+### 5.2.2 维护信息卡片机制
+
+维护信息卡片由独立的 API 获取（`status_page.js:558-582`）：
+
+```javascript
+static async getMaintenanceList(statusPageId) {
+    let maintenanceIDList = await R.getCol(
+        `SELECT DISTINCT maintenance_id
+         FROM maintenance_status_page
+         WHERE status_page_id = ?`,
+        [statusPageId]
+    );
+
+    for (const maintenanceID of maintenanceIDList) {
+        let maintenance = UptimeKumaServer.getInstance().getMaintenance(maintenanceID);
+        if (maintenance && (await maintenance.isUnderMaintenance())) {
+            publicMaintenanceList.push(await maintenance.toPublicJSON());
+        }
+    }
+    return publicMaintenanceList;
+}
+```
+
+**触发条件：** `maintenanceList.length > 0`
+
+**检查逻辑：**
+1. 从 `maintenance_status_page` 表查询与该状态页关联的维护窗口
+2. 检查每个维护窗口是否 `isUnderMaintenance()`
+3. 只返回**当前正在进行**的维护窗口
+
+---
+
+### 5.2.3 两种机制的独立与联动
+
+| 展示元素 | 触发条件 | 数据来源 | 与整体状态的关系 |
+|----------|----------|----------|------------------|
+| **整体状态徽章**（"维护中"） | `overallStatus()` 返回 `MAINTENANCE` | 所有监控的心跳状态（`publicLastHeartbeatList`） | 完全独立，不受维护窗口关联影响 |
+| **维护信息卡片**（标题+描述） | `maintenanceList.length > 0` | `maintenance_status_page` 表关联的维护窗口 | 完全独立，不受监控心跳状态影响 |
+
+#### 边界场景矩阵
+
+| 场景 | 监控心跳状态 | 维护窗口关联状态页 | 整体状态徽章 | 维护信息卡片 |
+|------|-------------|-------------------|--------------|--------------|
+| 场景 1 | 有监控在维护 | 维护窗口关联了状态页 | 🔧 维护中 | ✅ 显示卡片 |
+| 场景 2 | 有监控在维护 | 维护窗口**未关联**状态页 | 🔧 维护中 | ❌ 不显示卡片 |
+| 场景 3 | 无监控在维护 | 维护窗口关联了状态页且正在进行 | ⚡ 根据实际状态 | ✅ 显示卡片 |
+| 场景 4 | 无监控在维护 | 无活跃维护窗口 | ⚡ 根据实际状态 | ❌ 不显示卡片 |
+
+**场景 2 说明：** 即使没有为状态页配置任何维护窗口，只要状态页下的某个监控被添加到维护窗口中，状态页就会显示"维护中"。
+
+**场景 3 说明：** 可以创建"纯粹的公告式"维护信息卡片，不关联任何监控，只在状态页上显示维护通知，不影响任何监控的状态计算。
+
+---
+
+### 5.2.4 整体状态徽章展示
+
+```vue
+<!-- StatusPage.vue:401-404 -->
+<div v-else-if="isMaintenance">
+    <font-awesome-icon icon="wrench" class="status-maintenance" />
+    {{ $t("maintenanceStatus-under-maintenance") }}
+</div>
+```
+
+---
+
+### 5.2.5 维护信息卡片展示
 
 ```vue
 <!-- StatusPage.vue:412-425 -->
@@ -408,27 +550,6 @@ isMaintenance() {
     </div>
 </template>
 ```
-
-#### 5.2.3 整体状态徽章
-
-```vue
-<!-- StatusPage.vue:401-404 -->
-<div v-else-if="isMaintenance">
-    <font-awesome-icon icon="wrench" class="status-maintenance" />
-    {{ $t("maintenanceStatus-under-maintenance") }}
-</div>
-```
-
-### 5.3 状态页整体状态优先级
-
-状态页的整体状态有优先级顺序（隐含在 `StatusPage.vue` 的条件判断中）：
-
-1. `allUp` - 全部正常
-2. `partialDown` - 部分故障
-3. `allDown` - 全部故障
-4. `isMaintenance` - 维护中（但会被故障状态覆盖）
-
-**注意：** 如果有监控处于故障状态，即使在维护窗口内，状态页也会显示故障状态而非维护状态。
 
 ---
 
@@ -531,7 +652,7 @@ isMaintenance() {
 
 ### 8.1 核心设计理念
 
-1. **监控任务不暂停**：维护期间监控任务继续执行，但结果被覆盖为 MAINTENANCE 状态。这样可以在维护结束后立即知道服务是否真的恢复正常。
+1. **维护期间跳过探测**：使用 `if...else if` 结构，维护期间完全跳过所有实际的监控探测（HTTP/Ping/Docker 等），不消耗系统资源。
 
 2. **维护不计入 downtime**：从可用性角度，维护状态被视为"正常"，不影响 SLA 计算。
 
@@ -539,12 +660,19 @@ isMaintenance() {
 
 4. **实时状态同步**：维护状态变化通过 Socket.io 实时推送到前端，包括管理界面和状态页。
 
+5. **维护状态最高优先级**：在状态页的 `overallStatus()` 计算中，MAINTENANCE 状态优先级最高，一旦发现立即返回。
+
 ### 8.2 潜在注意事项
 
-1. **维护期间仍执行检查**：如果维护操作会导致检查失败（如服务确实停止），虽然不会触发告警，但心跳记录会显示为 MAINTENANCE 而非实际状态。
+1. **维护期间无实际探测**：维护结束后无法从心跳数据判断服务在维护期间的实际状态。如果需要确认维护期间服务状态，需要额外的验证机制。
 
-2. **状态页优先级**：故障状态优先级高于维护状态。如果监控在维护期间真的故障，状态页会显示故障。
+2. **状态页维护状态可能隐藏故障**：由于 MAINTENANCE 在 `overallStatus()` 中优先级最高，且维护中的监控心跳状态已是 MAINTENANCE，即使有监控实际故障，状态页也只会显示维护状态。
 
-3. **手动模式特性**：手动模式的维护窗口只要处于 active 状态，就会一直视为"维护中"。
+3. **状态页的两个独立触发条件**：
+   - 顶部维护信息卡片：只显示与状态页关联的维护窗口
+   - 整体状态徽章：只要状态页下的任何监控处于维护中就显示
+   - 可能出现：没有维护卡片但状态显示"维护中"的情况
 
-4. **时区处理**：维护窗口支持自定义时区，需要注意 Cron 表达式与时区的匹配。
+4. **手动模式特性**：手动模式的维护窗口只要处于 active 状态，就会一直视为"维护中"。
+
+5. **时区处理**：维护窗口支持自定义时区，需要注意 Cron 表达式与时区的匹配。
