@@ -708,7 +708,363 @@ socket.on("addStatusPage", async (title, slug, callback) => {
 2. 或者完全移除 `published` 字段，避免混淆
 3. 实现真正的密码保护功能
 
-### 5.8 相关未实现功能
+### 5.8 未登录用户获取 slug 的真实渠道分析
+
+#### 5.8.1 术语定义
+
+在深入分析之前，需要明确两个关键概念：
+
+| 概念 | 定义 | 风险等级 |
+|------|------|---------|
+| **可猜测** | 攻击者需要通过猜测、枚举或社会工程获取 slug | 中 |
+| **可枚举** | 存在公开接口或机制可以直接获取所有 slug 列表 | 高 |
+
+#### 5.8.2 公开端点分析
+
+经过代码审查，以下是所有可能暴露 slug 的公开端点：
+
+##### 端点 1：`GET /api/entry-page`
+
+**代码路径**：`server/routers/api-router.js:28-45`
+
+```javascript
+router.get("/api/entry-page", async (request, response) => {
+    let result = {};
+    let hostname = request.hostname;
+    // ...
+    if (hostname in StatusPage.domainMappingList) {
+        result.type = "statusPageMatchedDomain";
+        result.statusPageSlug = StatusPage.domainMappingList[hostname];
+    } else {
+        result.type = "entryPage";
+        result.entryPage = server.entryPage;
+    }
+    response.json(result);
+});
+```
+
+**访问权限**：✅ 未登录用户可访问
+
+**暴露内容**：
+- 如果访问域名匹配 `domainMappingList`：返回对应的 `statusPageSlug`
+- 如果入口页面是状态页（`entryPage` 以 `statusPage-` 开头）：返回完整的 `entryPage` 字符串，包含 slug
+
+**示例响应**：
+```json
+// 域名匹配情况
+{"type": "statusPageMatchedDomain", "statusPageSlug": "my-status-page"}
+
+// 入口页面是状态页
+{"type": "entryPage", "entryPage": "statusPage-default"}
+```
+
+**评估结论**：
+- ❌ **可枚举单条**：针对特定域名
+- ❌ **不可枚举全部**：无法获取所有状态页列表
+- ⚠️ **可猜测辅助**：如果入口页面是状态页，可以直接获取其 slug
+
+##### 端点 2：`GET /status/:slug` 及相关公开 API
+
+**代码路径**：
+- HTML：`server/routers/status-page-router.js:16-20`
+- 数据 API：`server/routers/status-page-router.js:39-60`
+- 心跳 API：`server/routers/status-page-router.js:64-110`
+- 事件历史 API：`server/routers/status-page-router.js:145-167`
+- 徽章 API：`server/routers/status-page-router.js:170-262`
+- RSS：`server/routers/status-page-router.js:22-26`
+- Manifest：`server/routers/status-page-router.js:113-143`
+
+**访问权限**：✅ 未登录用户可访问
+
+**404 行为分析**（`server/util-server.js:710-727`）：
+
+```javascript
+module.exports.sendHttpError = (res, msg = "") => {
+    // ...
+    } else if (msg.toLowerCase().includes("not found")) {
+        res.status(404).json({
+            status: "fail",
+            msg: msg,
+        });
+    } else {
+        res.status(403).json({
+            // ...
+        });
+    }
+};
+```
+
+**状态码差异**：
+| 情况 | HTTP 状态码 | 响应内容 |
+|------|------------|---------|
+| slug 存在 | 200 | 正常响应（HTML/JSON/XML） |
+| slug 不存在 | 404 | `{"status": "fail", "msg": "... Not Found"}` |
+
+**评估结论**：
+- ❌ **不可枚举**：没有直接返回列表的接口
+- ⚠️ **可蛮力枚举**：通过 404 vs 200 的差异可以暴力枚举可能的 slug
+- 📊 **枚举效率**：取决于 slug 命名模式和长度
+
+#### 5.8.3 默认 slug 分析
+
+**默认状态页**：
+- 数据库迁移时自动创建，slug 为 `"default"`（`server/database.js:627`）
+- 迁移代码：`statusPage.slug = "default";`
+
+**入口页面配置**：
+- 入口页面如果是状态页，格式为 `"statusPage-{slug}"`（`server/server.js:263`）
+- 示例：`"statusPage-default"`、`"statusPage-my-custom-page"`
+
+**评估结论**：
+- ⚠️ **`default` 是高度可猜测的**：几乎所有从旧版本升级的实例都有这个 slug
+- ⚠️ **入口页面泄漏**：如果入口页面是状态页，`/api/entry-page` 直接返回完整 slug
+
+#### 5.8.4 域名映射机制
+
+**代码路径**：
+- 域名列表维护：`server/model/status_page.js:376-420`
+- 入口检测：`server/server.js:258-262`、`server/routers/api-router.js:37-43`
+
+**工作原理**：
+1. 管理员可以为状态页配置域名列表（`domainNameList`）
+2. 系统在启动和保存时加载 `domainMappingList`
+3. 当请求的 `hostname` 匹配映射表中的域名时：
+   - 直接渲染对应状态页
+   - `/api/entry-page` 返回 `statusPageSlug`
+
+**示例**：
+```javascript
+// 如果管理员配置了
+// 状态页 "my-status-page" 绑定域名 "status.example.com"
+
+// 访问 http://status.example.com/api/entry-page
+// 返回：{"type": "statusPageMatchedDomain", "statusPageSlug": "my-status-page"}
+```
+
+**评估结论**：
+- ⚠️ **域名即泄露**：攻击者只要知道绑定的域名，就可以获取 slug
+- ⚠️ **多域名绑定**：一个状态页可以绑定多个域名，增加了泄露渠道
+
+#### 5.8.5 可枚举 vs 可猜测的区分
+
+让我创建一个完整的矩阵来区分这两种情况：
+
+| 攻击类型 | 描述 | 前置条件 | 成功率 | 风险等级 |
+|---------|------|---------|--------|---------|
+| **直接可枚举** | 有公开 API 返回完整 slug 列表 | 无 | 100% | ⭐⭐⭐⭐⭐ |
+| **部分可枚举** | 有公开 API 返回部分 slug（如域名映射） | 知道域名 | 100% | ⭐⭐⭐⭐ |
+| **可猜测（已知）** | 通过 `/api/entry-page` 获取入口页面 slug | 无 | 100% | ⭐⭐⭐⭐ |
+| **可猜测（默认）** | 尝试 `default`、`status`、`main` 等常见 slug | 无 | 取决于配置 | ⭐⭐⭐ |
+| **可猜测（命名模式）** | 管理员使用公司名、产品名作为 slug | 了解目标组织 | 高 | ⭐⭐⭐ |
+| **蛮力枚举** | 通过 404 vs 200 差异枚举所有可能 | 时间和计算资源 | 取决于复杂度 | ⭐⭐⭐ |
+| **域名枚举** | 通过 DNS 枚举发现绑定的状态页域名 | 知道主域名 | 中等 | ⭐⭐⭐ |
+| **社会工程** | 通过文档、截图、分享链接获取 slug | 内部信息 | 高 | ⭐⭐⭐⭐ |
+
+**关键发现**：
+- ❌ **不存在直接可枚举所有 slug 的公开接口**
+- ⚠️ **`/api/entry-page` 可枚举单条**（域名匹配或入口页面）
+- ⚠️ **`default` 是高度可猜测的**
+- ⚠️ **404 行为允许蛮力枚举**
+
+#### 5.8.6 404 行为的可观测差异
+
+让我详细分析 404 响应是否存在可用于枚举的特征：
+
+**公开端点的 404 响应**：
+
+| 端点 | slug 存在 | slug 不存在 | 可观测差异 |
+|------|----------|------------|-----------|
+| `GET /status/:slug`（HTML） | 200 + Vue 应用 | 404 + `{"status":"fail","msg":"Status Page Not Found"}` | ✅ 明显差异 |
+| `GET /api/status-page/:slug` | 200 + JSON 数据 | 404 + `{"status":"fail","msg":"Status Page Not Found"}` | ✅ 明显差异 |
+| `GET /api/status-page/heartbeat/:slug` | 200 + JSON 数组 | 404 + `{"status":"fail","msg":"Not Found"}` | ✅ 明显差异 |
+| `GET /api/status-page/:slug/incident-history` | 200 + JSON 分页 | 404 + `{"status":"fail","msg":"Status Page Not Found"}` | ✅ 明显差异 |
+| `GET /api/status-page/:slug/badge` | 200 + SVG 图片 | 404 + `{"status":"fail","msg":"Not Found"}` | ✅ 明显差异 |
+| `GET /status/:slug/rss` | 200 + XML | 404 + `{"status":"fail","msg":"Status Page Not Found"}` | ✅ 明显差异 |
+| `GET /api/status-page/:slug/manifest.json` | 200 + JSON | 404 + `{"status":"fail","msg":"Not Found"}` | ✅ 明显差异 |
+
+**响应时间分析**：
+- 存在的 slug：需要数据库查询 → 可能略慢
+- 不存在的 slug：数据库查询返回空 → 可能略快
+- 差异可能很小，但理论上存在时序攻击空间
+
+**缓存影响**：
+- 公开 API 使用 `apicache` 中间件
+- 存在的 slug 会被缓存
+- 不存在的 slug 可能不会被缓存
+- 这可能导致响应时间差异更加明显
+
+**评估结论**：
+- ⚠️ **完全可蛮力枚举**：所有公开端点都有明显的 404 vs 200 差异
+- ⚠️ **缓存机制可能放大差异**
+- 但枚举所有可能的 slug 仍然需要时间和计算资源
+
+#### 5.8.7 状态页列表的获取渠道
+
+**`statusPageList` 的发送机制**（`server/model/status_page.js:353-371`）：
+
+```javascript
+static async sendStatusPageList(socket) {
+    checkLogin(socket);  // 🔒 需要登录！
+    // ...
+    const list = await R.find("status_page", " ORDER BY id ");
+    // ...
+    io.to(socket.userID).emit("statusPageList", result);  // 🔒 只发送给特定用户
+}
+```
+
+**关键发现**：
+- ✅ **需要登录**：`checkLogin(socket)` 确保只有登录用户可以获取
+- ✅ **定向发送**：`io.to(socket.userID).emit(...)` 只发送给特定用户
+- ❌ **未登录用户无法获取**完整状态页列表
+
+**评估结论**：
+- ✅ **不存在公开的状态页列表接口**
+- 完整的 slug 枚举只能通过蛮力攻击或信息收集
+
+### 5.9 重算风险等级与前置条件
+
+基于以上分析，让我重新评估风险等级：
+
+#### 5.9.1 新的风险评估框架
+
+**新增维度**：
+
+| 维度 | 说明 | 权重 |
+|------|------|------|
+| **触发概率** | `published=0` 在真实环境中出现的可能性 | 25% |
+| **slug 获取难度** | 攻击者获取 slug 的难易程度 | 35% |
+| **数据暴露范围** | 未登录用户可以访问的数据量 | 25% |
+| **利用难度** | 攻击的技术门槛 | 15% |
+
+#### 5.9.2 slug 获取难度的细分评估
+
+| 场景 | slug 获取难度 | 评分（1-10） |
+|------|--------------|-------------|
+| 入口页面是状态页（通过 `/api/entry-page`） | 直接获取 | 1 |
+| 域名映射到状态页（通过 `/api/entry-page`） | 直接获取（需要知道域名） | 2 |
+| 默认 slug `default` | 高度可猜测 | 2 |
+| 管理员使用公司名/产品名作为 slug | 中等可猜测 | 4 |
+| 管理员使用随机/复杂 slug | 需要蛮力枚举 | 7 |
+| 完全随机的长 slug | 蛮力枚举不现实 | 9 |
+
+#### 5.9.3 各触发路径的重算风险等级
+
+##### 路径 1：数据库迁移（旧版本升级）
+
+**触发条件**：从 1.13.0 之前版本升级，且旧设置 `statusPagePublished=false`
+
+**风险重算**：
+- **触发概率**：低（只有特定升级路径）
+- **slug 获取难度**：
+  - 如果入口页面是状态页 → 直接获取（评分 1）
+  - 如果不是 → 需要猜测 `default`（评分 2）
+- **数据暴露范围**：高（所有公开分组数据）
+- **利用难度**：极低
+
+**综合风险等级**：
+- 如果入口页面是状态页：⭐⭐⭐⭐⭐（高风险）
+- 如果不是：⭐⭐⭐⭐（中高风险）
+
+##### 路径 2：手工修改数据库
+
+**触发条件**：管理员通过数据库工具直接修改 `published=0`
+
+**风险重算**：
+- **触发概率**：中
+- **slug 获取难度**：
+  - 如果入口页面是状态页 → 直接获取（评分 1）
+  - 如果有域名映射 → 直接获取（需要知道域名，评分 2）
+  - 如果是默认状态页 → 猜测 `default`（评分 2）
+  - 如果是自定义 slug → 取决于命名（评分 2-7）
+- **数据暴露范围**：高
+- **利用难度**：极低
+- **风险放大**：管理员可能产生虚假安全感
+
+**综合风险等级**：
+- 如果入口页面是状态页：⭐⭐⭐⭐⭐（高风险）
+- 如果有域名映射：⭐⭐⭐⭐⭐（高风险）
+- 如果是默认状态页：⭐⭐⭐⭐⭐（高风险）
+- 如果是复杂自定义 slug：⭐⭐⭐（中风险）
+
+##### 路径 3：数据库导入/恢复
+
+**触发条件**：从包含 `published=0` 的备份恢复
+
+**风险重算**：
+- **触发概率**：低到中
+- **slug 获取难度**：取决于备份来源
+- **数据暴露范围**：高
+- **利用难度**：极低
+
+**综合风险等级**：⭐⭐⭐（中风险）
+
+##### 路径 4：第三方脚本
+
+**触发条件**：自定义脚本直接操作数据库
+
+**风险重算**：
+- **触发概率**：低
+- **slug 获取难度**：取决于脚本用途
+- **数据暴露范围**：高
+- **利用难度**：极低
+
+**综合风险等级**：⭐⭐⭐（中风险）
+
+#### 5.9.4 综合风险矩阵
+
+让我创建一个综合风险评估矩阵：
+
+| 场景 | 触发概率 | slug 获取难度 | 数据暴露 | 利用难度 | 综合风险 |
+|------|---------|--------------|---------|---------|---------|
+| 入口页面 = 状态页 + `published=0` | 低-中 | **直接获取** | 高 | 极低 | ⭐⭐⭐⭐⭐ |
+| 域名映射 + `published=0` | 低-中 | **直接获取**（需知域名） | 高 | 极低 | ⭐⭐⭐⭐⭐ |
+| 默认状态页 `default` + `published=0` | 中 | **高度可猜测** | 高 | 极低 | ⭐⭐⭐⭐⭐ |
+| 自定义简单 slug + `published=0` | 中 | **中等可猜测** | 高 | 低 | ⭐⭐⭐⭐ |
+| 自定义复杂 slug + `published=0` | 中 | **需蛮力枚举** | 高 | 低-中 | ⭐⭐⭐ |
+| 无公开分组 + `published=0` | 中 | 同上 | **无数据** | 极低 | ⭐（低风险） |
+
+#### 5.9.5 关键前置条件
+
+要成功利用 `published=0` 的漏洞，攻击者需要满足以下前置条件：
+
+**必要条件**（AND 关系）：
+1. ✅ 状态页的 `published` 字段确实是 `0`
+2. ✅ 攻击者能够获取到状态页的 `slug`
+3. ✅ 状态页至少有一个公开分组（`group.public = 1`）
+4. ✅ 公开分组中至少有一个监控
+
+**可选条件**（OR 关系，用于获取 slug）：
+- 🔍 入口页面是状态页（`/api/entry-page` 返回 `statusPage-{slug}`）
+- 🔍 知道绑定的域名（`/api/entry-page` 返回 `statusPageSlug`）
+- 🔍 猜测到常见 slug（如 `default`、`status`、`main`）
+- 🔍 能够通过社会工程获取 slug
+- 🔍 能够实施蛮力枚举攻击
+
+**最危险的组合**：
+```
+published=0 
+AND (entryPage=statusPage-* OR 有域名映射 OR slug=default)
+AND 有公开分组
+AND 分组中有监控
+```
+
+这种组合的风险等级：⭐⭐⭐⭐⭐（极高风险）
+
+#### 5.9.6 风险缓解的优先级
+
+基于新的分析，重新排序风险缓解措施的优先级：
+
+| 优先级 | 措施 | 说明 | 实施难度 |
+|-------|------|------|---------|
+| **P0（紧急）** | 检查并确保所有状态页 `published=1` | 直接消除触发条件 | 低 |
+| **P0（紧急）** | 不将敏感监控添加到公开分组 | 减少数据暴露范围 | 低 |
+| **P1（高）** | 避免使用简单/可猜测的 slug | 增加获取难度 | 低 |
+| **P1（高）** | 避免将状态页设为入口页面 | 关闭直接获取渠道 | 低 |
+| **P1（高）** | 避免使用域名映射 | 关闭直接获取渠道 | 中 |
+| **P2（中）** | 修改代码添加 `published=1` 校验 | 长期修复 | 中 |
+| **P3（低）** | 实现真正的密码保护 | 长期增强 | 高 |
+
+### 5.10 相关未实现功能
 
 除了 `published` 字段外，`status_page` 表还有其他字段也未完全实现：
 
@@ -757,25 +1113,74 @@ Uptime Kuma 的公开状态页设计采用了**多层裁剪和隔离机制**：
 
 经过深入分析，发现了以下重要问题：
 
-1. **`published` 字段形同虚设**：
-   - 所有公开 API 端点都没有校验 `published` 字段
-   - 仅按 `slug` 查询，未发布的状态页仍然完全可访问
-   - 注释与代码不一致（`status-page-router.js:63` 声称 "Can fetch only if published"）
+#### 7.2.1 `published` 字段形同虚设
 
-2. **相关功能未实现**：
-   - `search_engine_index`：数据库字段存在，但无实际逻辑
-   - `password`：数据库字段存在，但无密码保护逻辑
-   - `isPublished`：前端计算属性定义了，但未被使用
+- 所有公开 API 端点都没有校验 `published` 字段
+- 仅按 `slug` 查询，未发布的状态页仍然完全可访问
+- 注释与代码不一致（`status-page-router.js:63` 声称 "Can fetch only if published"）
 
-3. **对公开数据边界的影响**：
-   - 管理员设置 `published=0` 无法隐藏状态页
-   - 唯一真正有效的隐私控制是：不将监控添加到公开分组
-   - 存在数据泄露风险：隐藏状态页可通过 slug 枚举访问
+#### 7.2.2 `published=0` 在真实系统中的触发路径
 
-### 7.3 结论
+| 路径 | 触发条件 | 概率 | 风险等级 |
+|------|---------|------|---------|
+| 数据库迁移 | 从 1.13.0 之前版本升级，且旧设置 `statusPagePublished=false` | 低 | ⭐⭐⭐⭐ |
+| 手工修改数据库 | 管理员通过数据库工具直接修改 `published=0` | 中 | ⭐⭐⭐⭐⭐ |
+| 数据库导入/恢复 | 从包含 `published=0` 的备份恢复 | 低-中 | ⭐⭐⭐ |
+| 第三方脚本 | 自定义脚本直接操作数据库 | 低 | ⭐⭐⭐ |
+
+#### 7.2.3 后台保存不会覆盖 `published` 字段
+
+**关键发现**：
+- 通过后台 UI 保存状态页时，`published` 字段**不会被修改**
+- 保存代码中相关行被注释掉（`server/socket-handlers/status-page-socket-handler.js:329-331`）
+- 如果状态页已经是 `published=0`，保存后**仍然是** `published=0`
+- 这意味着 `published=0` 一旦设置，会**永久保留**，除非直接操作数据库
+
+#### 7.2.4 相关功能未实现
+
+- `search_engine_index`：数据库字段存在，但无实际逻辑
+- `password`：数据库字段存在，但无密码保护逻辑
+- `isPublished`：前端计算属性定义了，但未被使用
+
+#### 7.2.5 对公开数据边界的影响
+
+- 管理员设置 `published=0` 无法隐藏状态页
+- 唯一真正有效的隐私控制是：不将监控添加到公开分组
+- 存在数据泄露风险：隐藏状态页可通过 slug 枚举访问
+- 最大风险是**虚假安全感**：管理员可能误以为 `published=0` 可以保护数据
+
+### 7.3 风险评估总结
+
+#### 7.3.1 整体风险等级
+
+**⭐⭐⭐⭐（中高风险）**
+
+#### 7.3.2 风险矩阵
+
+| 维度 | 评估 |
+|------|------|
+| 触发概率 | 低到中（取决于升级路径和管理员操作） |
+| 数据暴露范围 | 高（所有公开分组数据完全可访问） |
+| 攻击前置条件 | 知道或猜测 slug（`default` 很容易猜测） |
+| 利用难度 | 极低（标准 HTTP 请求即可） |
+
+#### 7.3.3 风险缓解建议
+
+**立即缓解**：
+1. **不要依赖 `published` 字段**：这是当前最有效的缓解方式
+2. **通过分组控制**：不希望公开的监控，不要添加到公开分组
+3. **检查数据库**：执行 `SELECT slug, published FROM status_page;` 确认所有状态页的 `published` 状态
+
+**长期修复（需要代码修改）**：
+1. 在所有公开端点添加 `published=1` 校验
+2. 或者完全移除 `published` 字段，避免混淆
+3. 实现真正的密码保护功能
+
+### 7.4 最终结论
 
 Uptime Kuma 的公开数据保护主要依赖于**分组的公开性**（`group.public` 字段），而不是状态页的发布态（`status_page.published`）。这意味着：
 
 - 如果不希望数据被公开，**不要将监控添加到公开分组**
 - 仅设置 `published=0` **无法阻止未登录用户访问数据**
 - 这是一个需要注意的设计特性（或潜在 bug）
+- **管理员不应依赖 `published` 字段作为安全控制**
