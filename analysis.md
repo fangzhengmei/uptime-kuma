@@ -335,7 +335,171 @@ async toPublicJSON(showTags = false, certExpiry = false) {
 
 ---
 
-## 5. 关键代码位置汇总
+## 5. 发布态（published=0）对未登录用户的影响分析
+
+### 5.1 状态页发布态的数据库模型
+
+`status_page` 表包含 `published` 字段（`db/old_migrations/patch-status-page.sql:11`）：
+```sql
+[published] BOOLEAN NOT NULL DEFAULT 1
+```
+
+- 默认值为 `1`（已发布）
+- 该字段在数据库初始化时从设置 `statusPagePublished` 继承（`server/database.js:632`）
+- 但在状态页保存时，该字段**不会被更新**（`server/socket-handlers/status-page-socket-handler.js:329` 被注释掉）
+
+### 5.2 各公开端点的发布态校验分析
+
+以下是所有公开 API 端点的读取路径和发布态校验情况：
+
+#### 5.2.1 状态页详情页（HTML 渲染）
+
+**读取路径**：
+1. `GET /status/:slug` → `server/routers/status-page-router.js:16-20`
+2. 调用 `StatusPage.handleStatusPageResponse()` → `server/model/status_page.js:57-71`
+3. 查询条件：`R.findOne("status_page", " slug = ? ", [slug])`
+
+**校验逻辑**：
+- ❌ **无发布态校验**，仅按 `slug` 查询
+- 如果状态页存在，直接返回渲染后的 HTML
+- 如果状态页不存在，返回 404
+
+#### 5.2.2 状态页数据 API
+
+**读取路径**：
+1. `GET /api/status-page/:slug` → `server/routers/status-page-router.js:39-60`
+2. 查询条件：`R.findOne("status_page", " slug = ? ", [slug])`
+3. 调用 `StatusPage.getStatusPageData(statusPage)` → `server/model/status_page.js:309-340`
+
+**校验逻辑**：
+- ❌ **无发布态校验**
+- 只要状态页存在，返回完整的公开数据：
+  - 状态页配置（包含 `published: false` 字段）
+  - 公开分组列表
+  - 活跃事件列表
+  - 进行中的维护计划
+
+#### 5.2.3 心跳数据 API
+
+**读取路径**：
+1. `GET /api/status-page/heartbeat/:slug` → `server/routers/status-page-router.js:64-110`
+2. 注释声称：`// Can fetch only if published`（第 63 行）
+3. 实际代码：
+   - `StatusPage.slugToID(slug)` → 仅通过 slug 获取 ID
+   - 通过 `status_page_id` 查询公开分组和监控
+
+**校验逻辑**：
+- ❌ **无发布态校验**（与注释矛盾！）
+- 只要知道 slug，就可以获取：
+  - 最近 100 条心跳记录
+  - 24 小时可用率百分比
+
+#### 5.2.4 事件历史 API
+
+**读取路径**：
+1. `GET /api/status-page/:slug/incident-history` → `server/routers/status-page-router.js:145-167`
+2. `StatusPage.slugToID(slug)` → 仅通过 slug 获取 ID
+3. `StatusPage.getIncidentHistory(statusPageID, cursor, true)`
+
+**校验逻辑**：
+- ❌ **无发布态校验**
+- 只要知道 slug，就可以获取完整的事件历史（分页）
+
+#### 5.2.5 状态徽章 API
+
+**读取路径**：
+1. `GET /api/status-page/:slug/badge` → `server/routers/status-page-router.js:170-262`
+2. `StatusPage.slugToID(slug)` → 仅通过 slug 获取 ID
+3. 查询该状态页下的公开分组和监控状态
+
+**校验逻辑**：
+- ❌ **无发布态校验**
+- 只要知道 slug，就可以获取：
+  - 整体状态（Up/Down/Degraded/Maintenance/N/A）
+  - SVG 格式的徽章图片
+
+#### 5.2.6 RSS 订阅
+
+**读取路径**：
+1. `GET /status/:slug/rss` → `server/routers/status-page-router.js:22-26`
+2. `StatusPage.handleStatusPageRSSResponse()` → `server/model/status_page.js:38-48`
+3. 查询条件：`R.findOne("status_page", " slug = ? ", [slug])`
+4. 调用 `StatusPage.renderRSS()` → `server/model/status_page.js:79-109`
+5. 调用 `StatusPage.getRSSPageData()` → `server/model/status_page.js:266-302`
+
+**校验逻辑**：
+- ❌ **无发布态校验**
+- 只要知道 slug，就可以获取：
+  - 当前状态描述
+  - 所有 DOWN 状态的监控列表（包含时间戳）
+
+#### 5.2.7 PWA Manifest
+
+**读取路径**：
+1. `GET /api/status-page/:slug/manifest.json` → `server/routers/status-page-router.js:113-143`
+2. 查询条件：`R.findOne("status_page", " slug = ? ", [slug])`
+
+**校验逻辑**：
+- ❌ **无发布态校验**
+- 返回 PWA 应用清单（标题、图标等）
+
+### 5.3 发布态校验汇总表
+
+| 端点 | 发布态校验 | 仅按 slug 查询 | 未登录用户可访问 |
+|------|-----------|---------------|-----------------|
+| `GET /status/:slug`（HTML） | ❌ 无 | ✅ 是 | ✅ 可访问完整页面 |
+| `GET /api/status-page/:slug` | ❌ 无 | ✅ 是 | ✅ 配置、分组、事件、维护 |
+| `GET /api/status-page/heartbeat/:slug` | ❌ 无 | ✅ 是 | ✅ 心跳、24h 可用率 |
+| `GET /api/status-page/:slug/incident-history` | ❌ 无 | ✅ 是 | ✅ 事件历史 |
+| `GET /api/status-page/:slug/badge` | ❌ 无 | ✅ 是 | ✅ 状态徽章 |
+| `GET /status/:slug/rss` | ❌ 无 | ✅ 是 | ✅ RSS 订阅 |
+| `GET /api/status-page/:slug/manifest.json` | ❌ 无 | ✅ 是 | ✅ PWA 清单 |
+
+### 5.4 对公开数据边界的影响
+
+#### 5.4.1 发布态字段形同虚设
+
+由于所有公开端点都没有校验 `published` 字段，导致：
+
+1. **未发布的状态页仍然完全可访问**：只要知道 slug，未登录用户可以访问所有公开数据
+2. **前端 `isPublished` 计算属性未使用**：`src/pages/StatusPage.vue:772-774` 定义了 `isPublished`，但代码中没有任何地方实际使用它
+3. **数据泄露风险**：如果管理员设置 `published=0` 希望隐藏状态页，实际上**完全没有效果**
+
+#### 5.4.2 与公开分组机制的关系
+
+发布态校验缺失与公开分组机制形成对比：
+
+| 机制 | 实际生效 | 作用 |
+|------|---------|------|
+| `group.public = 0/1` | ✅ 生效 | 控制哪些监控出现在状态页 |
+| `status_page.published = 0/1` | ❌ 不生效 | 仅作为数据字段存储，不影响访问 |
+
+这意味着：
+- 即使状态页设置为 `published=0`，公开分组中的监控数据仍然完全暴露
+- 唯一真正有效的隐私控制是：不将监控添加到公开分组
+
+#### 5.4.3 安全隐患
+
+1. **隐藏状态页可被枚举**：如果攻击者猜测或获取到 slug，即使状态页设置为"未发布"，数据仍然可访问
+2. **注释与代码不一致**：`status-page-router.js:63` 注释声称 "Can fetch only if published"，但实际代码没有实现，可能误导开发者
+3. **数据范围超出预期**：管理员可能认为设置 `published=0` 可以隐藏数据，但实际上：
+   - 状态页 HTML 完全可访问
+   - 所有公开 API 端点都可调用
+   - RSS 订阅正常工作
+   - 状态徽章可嵌入外部网站
+
+### 5.5 相关未实现功能
+
+除了 `published` 字段外，`status_page` 表还有其他字段也未完全实现：
+
+1. **`search_engine_index`**：数据库字段存在，但没有搜索引擎索引控制逻辑
+2. **`password`**：数据库字段存在，但没有密码保护的访问控制逻辑
+
+这些字段在 `server/socket-handlers/status-page-socket-handler.js:329-332` 中都被注释掉，不会在保存状态页时被更新。
+
+---
+
+## 6. 关键代码位置汇总
 
 | 功能 | 文件路径 | 行号 |
 |------|---------|------|
