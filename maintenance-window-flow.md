@@ -368,20 +368,29 @@ static isImportantForNotification(isFirstBeat, previousBeatStatus, currentBeatSt
 
 #### 3.3.4 首次心跳例外
 
-注意 `isFirstBeat` 参数：
+通知规则涉及三层过滤：
 
+**第一层：`isImportantBeat()`**
 ```javascript
 return (
-    isFirstBeat ||  // ⚠️ 首次心跳总是返回 true
+    isFirstBeat ||  // isFirstBeat 时总是返回 true
     // ... 其他条件
 );
 ```
-
-**首次心跳规则：**
 - `isFirstBeat = true` 时，无论状态是什么，都返回 `true`
-- 这意味着监控首次创建时，即使处于维护状态，也可能触发通知
+- 这决定了心跳是否被标记为 `important`
 
-但在 `sendNotification()` 中有额外检查：
+**第二层：`isImportantForNotification()`**
+```javascript
+return (
+    isFirstBeat ||  // isFirstBeat 时总是返回 true
+    // ... 其他条件
+);
+```
+- 同样，`isFirstBeat` 时总是返回 `true`
+- 这决定了心跳是否"应该"发送通知
+
+**第三层：`sendNotification()` 入口门禁（最终决定权）**
 ```javascript
 // monitor.js:1487
 if (!isFirstBeat || bean.status === DOWN) {
@@ -389,10 +398,15 @@ if (!isFirstBeat || bean.status === DOWN) {
 }
 ```
 
-**实际行为：**
-- 首次心跳是 `DOWN`：✅ 发送通知
-- 首次心跳是 `UP`：❌ 不发送通知
-- 首次心跳是 `MAINTENANCE`：❌ 不发送通知
+**最终行为（以第三层为准）：**
+
+| 首次心跳状态 | 条件 `!isFirstBeat \|\| status === DOWN` | 实际通知 |
+|-------------|---------------------------------------|----------|
+| `DOWN` | `false \|\| true` = `true` | ✅ **发送通知** |
+| `UP` | `false \|\| false` = `false` | ❌ **不发送** |
+| `MAINTENANCE` | `false \|\| false` = `false` | ❌ **不发送** |
+
+**结论：** 首次心跳只在 `DOWN` 状态时发送通知。这是一个安全设计：监控首次创建时，如果目标服务不可用，需要立即告警；如果服务正常或处于维护中，则不需要通知。
 
 ---
 
@@ -831,7 +845,28 @@ static async getMaintenanceList(statusPageId) {
 | 状态页有关联维护窗口但监控不在维护 | 显示维护卡片，状态徽章根据实际状态 | 可用于"纯粹公告"场景，如提前告知即将进行维护 |
 | 部分监控在维护 | 状态徽章显示"维护中" | 只要有一个监控在维护，整体就显示维护中 |
 
-#### 8.2.3 其他注意事项
+#### 8.2.3 通知规则细节
+
+1. **不是所有维护状态变化都不通知**
+   - ❌ 不通知：`UP → MAINTENANCE`、`DOWN → MAINTENANCE`、`MAINTENANCE → MAINTENANCE`、`MAINTENANCE → UP`
+   - ✅ **会通知**：`MAINTENANCE → DOWN`（维护结束但服务仍故障）
+
+2. **`MAINTENANCE → DOWN` 通知的设计意图**
+   - 维护期间：服务被视为"计划内不可用"，不发送告警
+   - 维护结束后：如果服务仍然 DOWN，必须通知用户
+   - 这是一个安全机制，确保维护操作没有遗漏或失败
+
+3. **首次心跳例外**
+   - 监控首次创建时（`isFirstBeat = true`），所有状态变化在 `isImportantBeat()` 和 `isImportantForNotification()` 中都返回 `true`
+   - 但 `sendNotification()` 有额外检查：`if (!isFirstBeat || bean.status === DOWN)`
+   - 实际效果：首次心跳只有 `DOWN` 会发送通知，`UP` 和 `MAINTENANCE` 不会
+
+4. **两层过滤机制**
+   - 第一层：`isImportantBeat()` - 决定是否标记为重要心跳（状态变化、缓存清除、推送更新）
+   - 第二层：`isImportantForNotification()` - 决定是否发送通知
+   - 关键差异：`MAINTENANCE → UP` 在第一层是重要的（更新状态），但第二层不通知
+
+#### 8.2.4 其他注意事项
 
 1. **维护期间无实际探测**：维护结束后无法从心跳数据判断服务在维护期间的实际状态。如果需要确认维护期间服务状态，需要额外的验证机制。
 
