@@ -88,12 +88,84 @@ MonitorType (基础类)
 | `tags` | array | 标签列表 |
 | `notificationIDList` | object | 通知ID列表 |
 
-#### 条件判断（支持条件的监控类型）
+#### 条件判断（仅支持特定类型）
 | 字段名 | 类型 | 说明 |
 |--------|------|------|
-| `conditions` | JSON | 条件表达式组（用于 DNS 等支持条件的类型） |
+| `conditions` | JSON | 条件表达式组（仅 DNS 等在 MonitorType 中设置了 `supportsConditions = true` 的类型支持） |
 
-### 2.2 类型专属字段边界分析
+### 2.2 条件表达式字段的归属规则
+
+**条件表达式字段 `conditions` 并非所有类型共享**，其归属由 `MonitorType.supportsConditions` 属性决定：
+
+#### 四类监控的条件支持情况
+
+| 监控类型 | 类型标识 | 实现方式 | `supportsConditions` | 是否显示条件表单 |
+|---------|---------|---------|---------------------|-----------------|
+| **HTTP** | `http` | 内联实现 | ❌ 不在 `monitorTypeList` 中 | 否 |
+| **Keyword** | `keyword` | 内联实现 | ❌ 不在 `monitorTypeList` 中 | 否 |
+| **JSON Query** | `json-query` | 内联实现 | ❌ 不在 `monitorTypeList` 中 | 否 |
+| **TCP** | `port` | 类继承 | ❌ 继承基类默认值 `false` | 否 |
+| **Ping** | `ping` | 内联实现 | ❌ 不在 `monitorTypeList` 中 | 否 |
+| **DNS** | `dns` | 类继承 | ✅ `DnsMonitorType.supportsConditions = true` | 是 |
+
+#### 代码依据
+
+1. **MonitorType 基类默认值**（`monitor-type.js:8`）：
+   ```javascript
+   class MonitorType {
+       supportsConditions = false;  // 默认不支持
+       conditionVariables = [];
+   }
+   ```
+
+2. **DNS 类型显式启用**（`dns.js:15-17`）：
+   ```javascript
+   class DnsMonitorType extends MonitorType {
+       supportsConditions = true;  // 显式启用条件支持
+       conditionVariables = [new ConditionVariable("record", defaultStringOperators)];
+   }
+   ```
+
+3. **TCP 类型继承默认值**（`tcp.js:100-101`）：
+   ```javascript
+   class TCPMonitorType extends MonitorType {
+       name = "port";
+       // 未重写 supportsConditions，继承基类的 false
+   }
+   ```
+
+4. **HTTP/Ping 不在 monitorTypeList 中**（`uptime-kuma-server.js:112-134`）：
+   ```javascript
+   // 只有类继承实现的类型会被注册到 monitorTypeList
+   UptimeKumaServer.monitorTypeList["dns"] = new DnsMonitorType();
+   UptimeKumaServer.monitorTypeList["port"] = new TCPMonitorType();
+   // HTTP、Ping 等内联实现的类型没有注册
+   ```
+
+5. **前端判断逻辑**（`EditMonitor.vue:1391, 3454-3459`）：
+   ```javascript
+   // computed 属性
+   supportsConditions() {
+       return this.$root.monitorTypeList[this.monitor.type]?.supportsConditions || false;
+   }
+   conditionVariables() {
+       return this.$root.monitorTypeList[this.monitor.type]?.conditionVariables || [];
+   }
+   
+   // 模板中条件渲染
+   <EditMonitorConditions
+       v-if="supportsConditions && conditionVariables.length > 0"
+       v-model="monitor.conditions"
+   />
+   ```
+
+#### 结论
+
+- **HTTP、Ping**：由于是内联实现，不在 `monitorTypeList` 中，条件组件不会显示
+- **TCP**：虽然在 `monitorTypeList` 中，但继承了基类的 `supportsConditions = false`，条件组件不会显示  
+- **DNS**：显式设置 `supportsConditions = true` 并提供 `conditionVariables`，条件组件会显示
+
+### 2.3 类型专属字段边界分析
 
 #### HTTP 类型专属字段
 | 字段名 | 类型 | 说明 |
@@ -1040,6 +1112,801 @@ constructor() {
     UptimeKumaServer.monitorTypeList["sqlserver"] = new MssqlMonitorType();
     UptimeKumaServer.monitorTypeList["mysql"] = new MysqlMonitorType();
     UptimeKumaServer.monitorTypeList["oracledb"] = new OracleDbMonitorType();
+}
+```
+
+---
+
+## 附录 B：四类监控类型前端表单到后端执行链路详细对比
+
+### B.1 四类监控类型执行链路架构对比
+
+#### B.1.1 架构模式分类
+
+| 监控类型 | 实现模式 | 代码位置 | 核心调用路径 |
+|---------|---------|---------|-------------|
+| **HTTP** | 内联实现 | `monitor.js:468-714` | `start()` → `if (type === "http")` → `makeAxiosRequest()` |
+| **Ping** | 内联实现 | `monitor.js:714-726` | `start()` → `if (type === "ping")` → `ping()` |
+| **TCP** | 类继承 | `tcp.js:100-409` | `start()` → `monitorTypeList["port"]` → `TCPMonitorType.check()` |
+| **DNS** | 类继承 | `dns.js:12-182` | `start()` → `monitorTypeList["dns"]` → `DnsMonitorType.check()` |
+
+**内联 vs 类继承的边界判断**：
+```javascript
+// monitor.js:905-918
+// 1. 先检查内联实现类型
+if (this.type === "http" || "keyword" || "json-query" || "ping" || ...) {
+    // 直接在 start() 方法中处理
+}
+// 2. 再检查类继承实现类型
+else if (this.type in UptimeKumaServer.monitorTypeList) {
+    const monitorType = UptimeKumaServer.monitorTypeList[this.type];
+    await monitorType.check(this, bean, server);
+}
+```
+
+---
+
+### B.2 前端表单阶段差异
+
+#### B.2.1 表单条件渲染逻辑
+
+**EditMonitor.vue 中的关键条件判断**：
+
+| 监控类型 | 条件表达式 | 显示的核心字段 |
+|---------|-----------|---------------|
+| **HTTP** | `monitor.type === 'http'` | `url`, `method`, `headers`, `body`, `maxredirects`, `accepted_statuscodes`, `authMethod` 等 |
+| **Keyword** | `monitor.type === 'keyword'` | 基础 HTTP 字段 + `keyword`, `invertKeyword` |
+| **JSON Query** | `monitor.type === 'json-query'` | 基础 HTTP 字段 + `jsonPath`, `jsonPathOperator`, `expectedValue` |
+| **TCP** | `monitor.type === 'port'` | `hostname`, `port`, `smtpSecurity`, `expected_tls_alert` |
+| **Ping** | `monitor.type === 'ping'` | `hostname`, `packetSize`, `ping_count`, `ping_numeric`, `ping_per_request_timeout` |
+| **DNS** | `monitor.type === 'dns'` | `hostname`, `dns_resolve_server`, `port`, `dns_resolve_type`, `conditions` |
+
+**前端字段显示逻辑代码示例**：
+
+```vue
+<!-- 1. URL 字段 - HTTP/Keyword/JSON Query 共享 -->
+<div v-if="monitor.type === 'http' || monitor.type === 'keyword' || 
+          monitor.type === 'json-query'" class="my-3">
+    <label for="url">{{ $t("URL") }}</label>
+    <input id="url" v-model="monitor.url" type="url" required 
+           pattern="https?://.+" />
+</div>
+
+<!-- 2. Hostname 字段 - TCP/Ping/DNS 共享 -->
+<div v-if="monitor.type === 'port' || monitor.type === 'ping' || 
+          monitor.type === 'dns'" class="my-3">
+    <label for="hostname">{{ $t("Hostname") }}</label>
+    <input id="hostname" v-model="monitor.hostname" type="text" required />
+</div>
+
+<!-- 3. Port 字段 - TCP/DNS 使用 -->
+<div v-if="monitor.type === 'port' || 
+          monitor.type === 'dns'" class="my-3">
+    <label for="port">{{ $t("Port") }}</label>
+    <input id="port" v-model="monitor.port" type="number" 
+           min="0" max="65535" />
+</div>
+
+<!-- 4. TCP 专属：安全模式选择 -->
+<div v-if="monitor.type === 'port'" class="my-3">
+    <label for="port_security">{{ $t("SSL/TLS") }}</label>
+    <select id="port_security" v-model="monitor.smtpSecurity">
+        <option value="nostarttls">{{ $t("None") }}</option>
+        <option value="secure">SSL</option>
+        <option value="starttls">STARTTLS</option>
+    </select>
+</div>
+
+<!-- 5. TCP 专属：期望 TLS 警报 -->
+<template v-if="monitor.type === 'port'">
+    <div class="my-3">
+        <label for="expected_tls_alert">{{ $t("Expected TLS Alert") }}</label>
+        <select id="expected_tls_alert" v-model="monitor.expectedTlsAlert">
+            <option value="none">{{ $t("None (Successful Connection)") }}</option>
+            <option value="certificate_required">certificate_required (116)</option>
+            <option value="bad_certificate">bad_certificate (42)</option>
+            <!-- ... 更多警报类型 -->
+        </select>
+    </div>
+</template>
+
+<!-- 6. DNS 专属字段组 -->
+<template v-if="monitor.type === 'dns'">
+    <!-- DNS 解析服务器 -->
+    <div class="my-3">
+        <label for="dns_resolve_server">{{ $t("Resolver Server(s)") }}</label>
+        <input id="dns_resolve_server" v-model="monitor.dns_resolve_server" required />
+        <div class="form-text">{{ $t("resolverserverDescription") }}</div>
+    </div>
+    
+    <!-- 记录类型选择 -->
+    <div class="my-3">
+        <label for="dns_resolve_type">{{ $t("Resource Record Type") }}</label>
+        <VueMultiselect id="dns_resolve_type" 
+                        v-model="monitor.dns_resolve_type"
+                        :options="dnsresolvetypeOptions" />
+    </div>
+</template>
+
+<!-- 7. 条件组件 - DNS 等支持条件的类型 -->
+<EditMonitorConditions
+    v-if="supportsConditions && conditionVariables.length > 0"
+    v-model="monitor.conditions"
+    :condition-variables="conditionVariables"
+/>
+```
+
+#### B.2.2 前端字段与后端字段映射表
+
+| 前端字段 (camelCase) | 后端字段 (snake_case) | HTTP | TCP | Ping | DNS | 转换方式 |
+|---------------------|----------------------|------|-----|------|-----|---------|
+| `retryOnlyOnStatusCodeFailure` | `retry_only_on_status_code_failure` | ✅ | ✅ | ❌ | ❌ | 显式映射 |
+| `saveResponse` | `save_response` | ✅ | ✅ | ❌ | ❌ | 显式映射 |
+| `saveErrorResponse` | `save_error_response` | ✅ | ✅ | ❌ | ❌ | 显式映射 |
+| `responseMaxLength` | `response_max_length` | ✅ | ✅ | ❌ | ❌ | 显式映射 |
+| `expectedTlsAlert` | `expected_tls_alert` | ❌ | ✅ | ❌ | ❌ | 显式映射 |
+| `accepted_statuscodes` | `accepted_statuscodes_json` | ✅ | ❌ | ❌ | ❌ | JSON.stringify |
+| `conditions` | `conditions` | ❌ | ❌ | ❌ | ✅ | JSON.stringify |
+| `headers` | `headers` | ✅ | ❌ | ❌ | ❌ | 直接存储 (JSON string) |
+| `body` | `body` | ✅ | ❌ | ❌ | ❌ | 直接存储 |
+| `method` | `method` | ✅ | ❌ | ❌ | ❌ | 直接存储 |
+| `url` | `url` | ✅ | ❌ | ❌ | ❌ | 直接存储 |
+| `hostname` | `hostname` | ❌ | ✅ | ✅ | ✅ | 直接存储 |
+| `port` | `port` | ❌ | ✅ | ❌ | ✅ | 直接存储 (parseInt) |
+| `keyword` | `keyword` | ⚠️ | ❌ | ❌ | ❌ | 直接存储 |
+| `invertKeyword` | `invertKeyword` | ⚠️ | ❌ | ❌ | ❌ | 直接存储 |
+| `jsonPath` | `jsonPath` | ⚠️ | ❌ | ❌ | ❌ | 直接存储 |
+| `jsonPathOperator` | `jsonPathOperator` | ⚠️ | ❌ | ❌ | ❌ | 直接存储 |
+| `expectedValue` | `expectedValue` | ⚠️ | ❌ | ❌ | ❌ | 直接存储 |
+| `smtpSecurity` | `smtpSecurity` | ❌ | ✅ | ❌ | ❌ | 直接存储 |
+| `dns_resolve_type` | `dns_resolve_type` | ❌ | ❌ | ❌ | ✅ | 直接存储 |
+| `dns_resolve_server` | `dns_resolve_server` | ❌ | ❌ | ❌ | ✅ | 直接存储 |
+| `packetSize` | `packetSize` | ❌ | ❌ | ✅ | ❌ | 直接存储 |
+| `ping_count` | `ping_count` | ❌ | ❌ | ✅ | ❌ | 直接存储 |
+| `ping_numeric` | `ping_numeric` | ❌ | ❌ | ✅ | ❌ | 直接存储 |
+| `ping_per_request_timeout` | `ping_per_request_timeout` | ❌ | ❌ | ✅ | ❌ | 直接存储 |
+
+**字段映射代码位置**：`server/server.js:800-939`
+
+```javascript
+// 添加监控时使用 bean.import() 自动导入
+bean.import(monitor);
+// 特殊字段显式映射
+if (monitor.retryOnlyOnStatusCodeFailure !== undefined) {
+    bean.retry_only_on_status_code_failure = monitor.retryOnlyOnStatusCodeFailure;
+}
+
+// 编辑监控时全部显式赋值
+bean.url = monitor.url;
+bean.hostname = monitor.hostname;
+bean.port = parseInt(monitor.port);
+bean.save_response = monitor.saveResponse;
+bean.save_error_response = monitor.saveErrorResponse;
+bean.response_max_length = monitor.responseMaxLength;
+bean.expected_tls_alert = monitor.expectedTlsAlert;
+// ... 更多字段
+```
+
+---
+
+### B.3 后端保存阶段差异
+
+#### B.3.1 添加监控 vs 编辑监控
+
+| 阶段 | 实现方式 | HTTP/TCP/Ping/DNS 差异 |
+|------|---------|----------------------|
+| **添加监控** | `bean.import(monitor)` + 特殊字段映射 | 无差异，统一处理 |
+| **编辑监控** | 逐字段显式赋值 | 无差异，统一处理 |
+
+**添加监控流程**（server.js:725-797）：
+```javascript
+// 1. 创建 bean
+let bean = R.dispense("monitor");
+
+// 2. JSON 字段序列化
+monitor.accepted_statuscodes_json = JSON.stringify(monitor.accepted_statuscodes);
+monitor.conditions = JSON.stringify(monitor.conditions);
+
+// 3. 删除前端仅用字段
+const frontendOnlyProperties = [
+    "humanReadableInterval",
+    "globalpingdnsresolvetypeoptions",
+    "responsecheck",
+];
+for (const prop of frontendOnlyProperties) {
+    if (prop in monitor) delete monitor[prop];
+}
+
+// 4. 自动导入字段
+bean.import(monitor);
+
+// 5. 特殊字段映射
+if (monitor.retryOnlyOnStatusCodeFailure !== undefined) {
+    bean.retry_only_on_status_code_failure = monitor.retryOnlyOnStatusCodeFailure;
+}
+
+// 6. 验证并存储
+bean.validate();
+await R.store(bean);
+```
+
+**编辑监控流程**（server.js:800-969）：
+```javascript
+// 1. 加载现有 bean
+let bean = await R.findOne("monitor", " id = ? ", [monitor.id]);
+
+// 2. 逐字段显式赋值（HTTP 相关）
+bean.url = monitor.url;
+bean.method = monitor.method;
+bean.body = monitor.body;
+bean.headers = monitor.headers;
+bean.httpBodyEncoding = monitor.httpBodyEncoding;
+bean.maxredirects = monitor.maxredirects;
+bean.accepted_statuscodes_json = JSON.stringify(monitor.accepted_statuscodes);
+bean.ipFamily = monitor.ipFamily;
+bean.cacheBust = monitor.cacheBust;
+bean.keyword = monitor.keyword;
+bean.invertKeyword = monitor.invertKeyword;
+bean.jsonPath = monitor.jsonPath;
+bean.jsonPathOperator = monitor.jsonPathOperator;
+bean.expectedValue = monitor.expectedValue;
+
+// 2. 逐字段显式赋值（TCP/Ping/DNS 共享）
+bean.hostname = monitor.hostname;
+bean.port = parseInt(monitor.port);
+
+// 3. 逐字段显式赋值（TCP 专属）
+bean.smtpSecurity = monitor.smtpSecurity;
+bean.expected_tls_alert = monitor.expectedTlsAlert;
+
+// 4. 逐字段显式赋值（Ping 专属）
+bean.packetSize = monitor.packetSize;
+bean.ping_numeric = monitor.ping_numeric;
+bean.ping_count = monitor.ping_count;
+bean.ping_per_request_timeout = monitor.ping_per_request_timeout;
+
+// 5. 逐字段显式赋值（DNS 专属）
+bean.dns_resolve_type = monitor.dns_resolve_type;
+bean.dns_resolve_server = monitor.dns_resolve_server;
+bean.conditions = JSON.stringify(monitor.conditions);
+
+// 6. 验证并存储
+bean.validate();
+await R.store(bean);
+```
+
+#### B.3.2 验证阶段差异
+
+`validate()` 方法中的类型专属验证：
+
+| 监控类型 | 验证内容 | 代码位置 |
+|---------|---------|---------|
+| **HTTP** | JSON 格式验证（headers、accepted_statuscodes） | monitor.js:1717-1731 |
+| **Ping** | packetSize、ping_count、ping_per_request_timeout 范围验证 | monitor.js:1733-1772 |
+| **TCP** | 无专属验证 | - |
+| **DNS** | 无专属验证 | - |
+
+**Ping 类型详细验证规则**：
+```javascript
+// monitor.js:1733-1772
+if (this.type === "ping") {
+    // 数据包大小验证
+    if (this.packetSize && 
+        (this.packetSize < PING_PACKET_SIZE_MIN || 
+         this.packetSize > PING_PACKET_SIZE_MAX)) {
+        throw new Error(
+            `Packet size must be between ${PING_PACKET_SIZE_MIN} and 
+             ${PING_PACKET_SIZE_MAX} (default: ${PING_PACKET_SIZE_DEFAULT})`
+        );
+    }
+    
+    // 发送次数验证
+    if (this.ping_count && 
+        (this.ping_count < PING_COUNT_MIN || 
+         this.ping_count > PING_COUNT_MAX)) {
+        throw new Error(
+            `Echo requests count must be between ${PING_COUNT_MIN} and 
+             ${PING_COUNT_MAX} (default: ${PING_COUNT_DEFAULT})`
+        );
+    }
+    
+    // 单次超时验证
+    if (this.ping_per_request_timeout && 
+        (this.ping_per_request_timeout < PING_PER_REQUEST_TIMEOUT_MIN ||
+         this.ping_per_request_timeout > PING_PER_REQUEST_TIMEOUT_MAX)) {
+        throw new Error(
+            `Per-ping timeout must be between ${PING_PER_REQUEST_TIMEOUT_MIN} and 
+             ${PING_PER_REQUEST_TIMEOUT_MAX} seconds`
+        );
+    }
+    
+    // 全局超时必须大于单次超时
+    if (this.timeout) {
+        const pingGlobalTimeout = Math.round(Number(this.timeout));
+        if (pingGlobalTimeout < this.ping_per_request_timeout) {
+            throw new Error(
+                `Timeout must be greater than per-request timeout`
+            );
+        }
+    }
+}
+```
+
+**HTTP 类型通用验证**：
+```javascript
+// monitor.js:1717-1731
+// Headers JSON 格式验证
+if (this.headers) {
+    try {
+        JSON.parse(this.headers);
+    } catch (e) {
+        throw new Error(`Headers must be valid JSON: ${e.message}`);
+    }
+}
+
+// Accepted status codes JSON 格式验证
+if (this.accepted_statuscodes_json) {
+    try {
+        JSON.parse(this.accepted_statuscodes_json);
+    } catch (e) {
+        throw new Error(`Accepted status codes must be valid JSON: ${e.message}`);
+    }
+}
+```
+
+---
+
+### B.4 后端执行阶段差异
+
+#### B.4.1 执行路径对比
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Monitor.start() / beat()                      │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+        ┌─────────────────────────────────────────────┐
+        │        第一级：内联实现类型判断               │
+        └─────────────────────────────────────────────┘
+        │
+        ├── HTTP/Keyword/JSON Query → monitor.js:468-714
+        │       ├── HTTP: axios 发送请求 → 状态码检查
+        │       ├── Keyword: 状态码检查 + 关键词搜索
+        │       └── JSON Query: 状态码检查 + JSON 路径查询
+        │
+        ├── Ping → monitor.js:714-726
+        │       └── ping() 函数 → ICMP 请求
+        │
+        └── 其他类型 → 进入第二级判断
+                │
+                ▼
+        ┌─────────────────────────────────────────────┐
+        │        第二级：类继承实现类型判断              │
+        │   if (type in UptimeKumaServer.monitorTypeList) │
+        └─────────────────────────────────────────────┘
+        │
+        ├── TCP (type: "port") → TCPMonitorType.check()
+        │       ├── 标准 TCP: tcping()
+        │       ├── TLS 证书检查: 当 smtpSecurity 为 secure/starttls
+        │       └── mTLS 验证: 当 expected_tls_alert 不为 none
+        │
+        └── DNS (type: "dns") → DnsMonitorType.check()
+                ├── 解析 DNS 服务器（支持主机名解析）
+                ├── 根据记录类型执行查询
+                ├── 条件评估
+                └── 保存查询结果到 dns_last_result
+```
+
+#### B.4.2 HTTP 类型执行链路详解
+
+**代码位置**：`monitor.js:468-714`
+
+```javascript
+if (this.type === "http" || this.type === "keyword" || this.type === "json-query") {
+    let startTime = dayjs().valueOf();
+    
+    // 1. 认证处理
+    let basicAuthHeader = {};
+    if (this.auth_method === "basic") {
+        basicAuthHeader = {
+            Authorization: "Basic " + encodeBase64(this.basic_auth_user, this.basic_auth_pass),
+        };
+    }
+    
+    let oauth2AuthHeader = {};
+    if (this.auth_method === "oauth2-cc") {
+        // 获取/刷新 OAuth2 token
+        this.oauthAccessToken = await this.makeOidcTokenClientCredentialsRequest();
+        oauth2AuthHeader = {
+            Authorization: this.oauthAccessToken.token_type + " " + this.oauthAccessToken.access_token,
+        };
+    }
+    
+    // 2. 构建 Axios 选项
+    const options = {
+        url: this.url,
+        method: (this.method || "get").toLowerCase(),
+        timeout: this.timeout * 1000,
+        headers: {
+            Accept: "text/html,application/xhtml+xml,...",
+            ...basicAuthHeader,
+            ...oauth2AuthHeader,
+            ...(this.headers ? JSON.parse(this.headers) : {}),
+        },
+        maxRedirects: this.maxredirects,
+        validateStatus: (status) => {
+            return checkStatusCode(status, this.getAcceptedStatuscodes());
+        },
+    };
+    
+    // 3. 请求体处理
+    if (this.body && typeof this.body === "string") {
+        if (!this.httpBodyEncoding || this.httpBodyEncoding === "json") {
+            options.data = JSON.parse(this.body);
+            options.headers["Content-Type"] = "application/json";
+        } else if (this.httpBodyEncoding === "form") {
+            options.data = this.body;
+            options.headers["Content-Type"] = "application/x-www-form-urlencoded";
+        }
+    }
+    
+    // 4. 代理处理
+    if (this.proxy_id) {
+        const proxy = await R.load("proxy", this.proxy_id);
+        if (proxy && proxy.active) {
+            const { httpAgent, httpsAgent } = Proxy.createAgents(proxy, ...);
+            options.httpAgent = httpAgent;
+            options.httpsAgent = httpsAgent;
+        }
+    }
+    
+    // 5. mTLS 处理
+    if (this.auth_method === "mtls") {
+        if (this.tlsCert) options.httpsAgent.options.cert = Buffer.from(this.tlsCert);
+        if (this.tlsCa) options.httpsAgent.options.ca = Buffer.from(this.tlsCa);
+        if (this.tlsKey) options.httpsAgent.options.key = Buffer.from(this.tlsKey);
+    }
+    
+    // 6. 发送请求
+    let res = await this.makeAxiosRequest(options);
+    bean.msg = `${res.status} - ${res.statusText}`;
+    bean.ping = dayjs().valueOf() - startTime;
+    
+    // 7. 子类型差异化处理
+    if (this.type === "http") {
+        bean.status = UP;
+    } 
+    else if (this.type === "keyword") {
+        // 关键词检查
+        let data = res.data;
+        if (typeof data !== "string") {
+            data = JSON.stringify(data);
+        }
+        let keywordFound = data.includes(this.keyword);
+        if (keywordFound === !this.isInvertKeyword()) {
+            bean.status = UP;
+        } else {
+            throw new Error("keyword not found");
+        }
+    } 
+    else if (this.type === "json-query") {
+        // JSON 查询验证
+        const { status, response } = await evaluateJsonQuery(
+            res.data,
+            this.jsonPath,
+            this.jsonPathOperator,
+            this.expectedValue
+        );
+        if (status) {
+            bean.status = UP;
+        } else {
+            throw new Error(`JSON query does not pass`);
+        }
+    }
+}
+```
+
+#### B.4.3 Ping 类型执行链路详解
+
+**代码位置**：`monitor.js:714-726`
+
+```javascript
+else if (this.type === "ping") {
+    // 直接调用 ping 函数
+    bean.ping = await ping(
+        this.hostname,           // 目标主机名
+        this.ping_count,         // 发送次数 (默认 1)
+        "",                      // 预留参数
+        this.ping_numeric,       // 是否仅输出数字 IP (默认 true)
+        this.packetSize,         // 数据包大小 (默认 56)
+        this.timeout,            // 全局超时 (默认 20s)
+        this.ping_per_request_timeout  // 单次请求超时 (默认 2s)
+    );
+    bean.msg = "";
+    bean.status = UP;
+}
+```
+
+**Ping 执行特点**：
+- 调用 `src/util.js` 中的 `ping()` 函数
+- 依赖系统级 ping 命令
+- 只要 ping 成功返回就认为 UP（无额外条件检查）
+- 无子类型，单一实现
+
+#### B.4.4 TCP 类型执行链路详解
+
+**代码位置**：`tcp.js:100-409`
+
+```javascript
+class TCPMonitorType extends MonitorType {
+    name = "port";
+    
+    async check(monitor, heartbeat, _server) {
+        const expectedTlsAlert = monitor.expected_tls_alert;
+        
+        // 分支 1: mTLS 验证模式
+        if (expectedTlsAlert && expectedTlsAlert !== "none") {
+            await this.checkTlsAlert(monitor, heartbeat, expectedTlsAlert);
+            return;
+        }
+        
+        // 分支 2: 标准 TCP 检查
+        await this.checkTcp(monitor, heartbeat);
+    }
+    
+    async checkTcp(monitor, heartbeat) {
+        // 2.1 基础 TCP 连通性检查
+        try {
+            const resp = await tcping(monitor.hostname, monitor.port);
+            heartbeat.ping = resp;
+            heartbeat.msg = `${resp} ms`;
+            heartbeat.status = UP;
+        } catch {
+            throw new Error("Connection failed");
+        }
+        
+        // 2.2 TLS 证书检查（可选）
+        if (["secure", "starttls"].includes(monitor.smtpSecurity) && 
+            monitor.isEnabledExpiryNotification()) {
+            // STARTTLS 握手
+            const reuseSocket = monitor.smtpSecurity === "starttls" 
+                ? await this.performStartTls(monitor) 
+                : {};
+            
+            // 证书验证
+            await this.checkTlsCertificate(monitor, reuseSocket);
+        }
+    }
+    
+    async checkTlsAlert(monitor, heartbeat, expectedTlsAlert) {
+        // 3.1 尝试 TLS 连接
+        const result = await this.attemptTlsConnection(monitor, options, startTime, timeout);
+        
+        // 3.2 验证是否收到期望的警报
+        if (result.alertName === expectedTlsAlert) {
+            heartbeat.status = UP;
+            heartbeat.msg = `TLS alert received as expected: ${result.alertName}`;
+        } 
+        else if (result.success) {
+            // 连接成功但期望失败（例如未验证客户端证书）
+            throw new Error(
+                `Expected TLS alert '${expectedTlsAlert}' but connection succeeded. ` +
+                `The server accepted the connection without requiring a client certificate.`
+            );
+        } 
+        else {
+            // 收到其他警报
+            throw new Error(
+                `Expected TLS alert '${expectedTlsAlert}' but received '${result.alertName}'`
+            );
+        }
+    }
+}
+```
+
+**TCP 类型条件判断流程**：
+```
+check(monitor, heartbeat)
+    │
+    ├── expected_tls_alert === "none" 或 null?
+    │   ├── YES → checkTcp()
+    │   │       ├── 基础 TCP 连通性
+    │   │       └── smtpSecurity === "secure" 或 "starttls"?
+    │   │           └── YES → TLS 证书检查
+    │   │
+    │   └── NO → checkTlsAlert()
+    │           ├── 尝试 TLS 连接
+    │           └── 验证收到的警报是否匹配期望值
+```
+
+#### B.4.5 DNS 类型执行链路详解
+
+**代码位置**：`dns.js:12-182`
+
+```javascript
+class DnsMonitorType extends MonitorType {
+    name = "dns";
+    supportsConditions = true;  // 支持条件判断
+    conditionVariables = [
+        new ConditionVariable("record", defaultStringOperators)
+    ];
+    
+    async check(monitor, heartbeat, _server) {
+        let startTime = dayjs().valueOf();
+        
+        // 1. 解析 DNS 服务器地址（支持主机名）
+        const resolverServers = await this.resolveDnsResolverServers(
+            monitor.dns_resolve_server
+        );
+        
+        // 2. 执行 DNS 查询
+        let dnsRes = await this.dnsResolve(
+            monitor.hostname,           // 要查询的域名
+            resolverServers,            // 解析服务器
+            monitor.port,               // DNS 端口 (默认 53)
+            monitor.dns_resolve_type    // 记录类型
+        );
+        heartbeat.ping = dayjs().valueOf() - startTime;
+        
+        // 3. 加载条件表达式
+        const conditions = ConditionExpressionGroup.fromMonitor(monitor);
+        let conditionsResult = true;
+        const handleConditions = (data) => 
+            (conditions ? evaluateExpressionGroup(conditions, data) : true);
+        
+        // 4. 根据记录类型处理结果
+        let dnsMessage = "";
+        switch (monitor.dns_resolve_type) {
+            case "A":
+            case "AAAA":
+            case "PTR":
+                // 多条记录：任一匹配即通过
+                dnsMessage = `Records: ${dnsRes.join(" | ")}`;
+                conditionsResult = dnsRes.some(
+                    (record) => handleConditions({ record })
+                );
+                break;
+                
+            case "MX":
+                // MX 记录：检查 exchange 字段
+                dnsMessage = dnsRes.map(
+                    (record) => `Hostname: ${record.exchange} - Priority: ${record.priority}`
+                ).join(" | ");
+                conditionsResult = dnsRes.some(
+                    (record) => handleConditions({ record: record.exchange })
+                );
+                break;
+                
+            case "CNAME":
+                // CNAME：精确匹配
+                dnsMessage = dnsRes[0];
+                conditionsResult = handleConditions({ record: dnsRes[0] });
+                break;
+                
+            // ... 其他记录类型
+        }
+        
+        // 5. 保存查询结果到数据库
+        if (monitor.dns_last_result !== dnsMessage && dnsMessage !== undefined) {
+            await R.exec(
+                "UPDATE `monitor` SET dns_last_result = ? WHERE id = ? ", 
+                [dnsMessage, monitor.id]
+            );
+        }
+        
+        // 6. 验证条件结果
+        if (!conditionsResult) {
+            throw new Error(dnsMessage);
+        }
+        
+        heartbeat.msg = dnsMessage;
+        heartbeat.status = UP;
+    }
+}
+```
+
+**DNS 类型条件判断流程**：
+```
+check(monitor, heartbeat)
+    │
+    ├── 1. 解析 DNS 服务器地址
+    │   ├── 输入: "8.8.8.8, 1.1.1.1"
+    │   └── 支持主机名 → 自动解析为 IP
+    │
+    ├── 2. 执行 DNS 查询
+    │   └── dnsResolve(hostname, servers, port, type)
+    │
+    ├── 3. 按记录类型处理
+    │   ├── A/AAAA/PTR/NS: 任一记录匹配
+    │   ├── MX: 任一记录的 exchange 字段匹配
+    │   ├── CNAME: 精确匹配
+    │   └── SOA: nsname 字段匹配
+    │
+    ├── 4. 条件评估
+    │   ├── 无条件 → 直接通过
+    │   └── 有条件 → 调用 evaluateExpressionGroup()
+    │
+    └── 5. 保存结果
+        └── UPDATE monitor SET dns_last_result = ?
+```
+
+---
+
+### B.5 四类监控类型执行链路汇总表
+
+| 维度 | HTTP | TCP | Ping | DNS |
+|------|------|-----|------|-----|
+| **实现模式** | 内联实现 | 类继承 | 内联实现 | 类继承 |
+| **类型标识** | `http` | `port` | `ping` | `dns` |
+| **前端目标字段** | `url` | `hostname` + `port` | `hostname` | `hostname` + `port` |
+| **核心库/函数** | `axios` | `tcp-ping`, `tls` | 系统 `ping` | `node:dns/promises` |
+| **是否支持子类型** | 是 (keyword, json-query) | 否 | 否 | 否 (但支持多种记录类型) |
+| **是否支持条件判断** | 否 | 否 | 否 | 是 (supportsConditions = true) |
+| **专属验证逻辑** | JSON 格式 | 无 | 参数范围 | 无 |
+| **状态确定方式** | 状态码 + 可选子类型检查 | 连通性 + 可选 TLS 检查 | 连通性 | 解析成功 + 条件检查 |
+| **额外副作用** | 证书过期检查 | 证书过期检查 | 无 | 更新 `dns_last_result` |
+| **支持代理** | 是 | 否 | 否 | 否 |
+| **支持认证** | 是 (basic/oauth2/ntlm/mtls) | 否 (仅 mTLS 验证模式) | 否 | 否 |
+
+### B.6 边界判断依据总结
+
+#### B.6.1 前端边界判断依据
+
+| 边界类型 | 判断条件 | 示例 |
+|---------|---------|------|
+| **HTTP 系** | `monitor.type === 'http' \|\| 'keyword' \|\| 'json-query'` | 显示 URL、Method、Headers 等字段 |
+| **网络系** | `monitor.type === 'port' \|\| 'ping' \|\| 'dns'` | 显示 Hostname 字段 |
+| **TCP 专属** | `monitor.type === 'port'` | 显示 Port、smtpSecurity、expected_tls_alert |
+| **DNS 专属** | `monitor.type === 'dns'` | 显示 dns_resolve_server、dns_resolve_type |
+| **条件组件** | `supportsConditions && conditionVariables.length > 0` | DNS 等类型显示条件编辑器 |
+
+#### B.6.2 后端执行边界判断依据
+
+| 监控类型 | 第一级判断 (内联) | 第二级判断 (类继承) |
+|---------|------------------|-------------------|
+| **HTTP** | `type === "http"` | 不进入 |
+| **Keyword** | `type === "keyword"` | 不进入 |
+| **JSON Query** | `type === "json-query"` | 不进入 |
+| **Ping** | `type === "ping"` | 不进入 |
+| **TCP** | 不匹配 | `type in monitorTypeList` → `TCPMonitorType` |
+| **DNS** | 不匹配 | `type in monitorTypeList` → `DnsMonitorType` |
+
+#### B.6.3 类型专属执行分支判断
+
+**TCP 内部分支**：
+```javascript
+if (expectedTlsAlert && expectedTlsAlert !== "none") {
+    // mTLS 验证模式
+    checkTlsAlert()
+} else {
+    // 标准 TCP 模式
+    checkTcp()
+    if (smtpSecurity 为 secure 或 starttls) {
+        // TLS 证书检查
+        checkTlsCertificate()
+    }
+}
+```
+
+**DNS 记录类型分支**：
+```javascript
+switch (dns_resolve_type) {
+    case "A":
+    case "AAAA":
+    case "PTR":
+        // 多记录：任一匹配
+        conditionsResult = dnsRes.some(record => handleConditions({ record }))
+        break
+    case "CNAME":
+        // 单记录：精确匹配
+        conditionsResult = handleConditions({ record: dnsRes[0] })
+        break
+    case "MX":
+        // 结构化记录：检查特定字段
+        conditionsResult = dnsRes.some(record => handleConditions({ record: record.exchange }))
+        break
+    // ...
 }
 ```
 
