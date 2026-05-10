@@ -257,16 +257,22 @@ for (let key of keyList) {
 }
 ```
 
-**标准写入时的值处理**：
+**标准写入时的值处理（注意：`JSON.stringify(undefined)` 返回 `undefined` 本身，不是字符串 `"undefined"`）
 
-| 输入值 | JSON.stringify 结果 | 数据库存储（value 列） |
-|--------|-----------------|---------------------|
-| `"hello"` | `"\"hello\""` | `"\"hello\""`（带引号的字符串） |
-| `123` | `"123"` | `"123"`（数字字符串） |
-| `true` | `"true"` | `"true"`（布尔字符串） |
-| `{a: 1}` | `"{\"a\":1}"` | `"{\"a\":1}"`（对象序列化） |
-| `null` | `"null"` | `"null"`（null 字符串） |
-| `undefined` | `"undefined"` | `"undefined"` |
+| 输入值 | JSON.stringify 结果 | `bean.value` 值 | 数据库存储（value 列） | 是否有效落库 |
+|--------|---------------------|---------------|----------------------|-----------|
+| `"hello"` | `"\"hello\""` | `"\"hello\""` | `"\"hello\""`（带引号的字符串） | ✅ 是 |
+| `123` | `"123"` | `"123"` | `"123"`（数字字符串） | ✅ 是 |
+| `true` | `"true"` | `"true"` | `"true"`（布尔字符串） | ✅ 是 |
+| `{a: 1}` | `"{\"a\":1}"` | `"{\"a\":1}"` | `"{\"a\":1}"`（对象序列化） | ✅ 是 |
+| `null` | `"null"` | `"null"` | `"null"`（null 字符串） | ✅ 是 |
+| `undefined` | `undefined` | `undefined` | `NULL`（数据库 NULL） | ⚠️ 特殊情况 |
+
+**关键发现**：
+- `JSON.stringify(undefined)` 返回 `undefined` 本身（不是字符串 `"undefined"`）
+- 所以 `bean.value = undefined` 会导致数据库中存储为 `NULL`
+- 读取时 `JSON.parse(null)` 成功解析为 `null`，会被缓存
+- 这意味着 `Settings.set(key, undefined)` 实际上会存储 `NULL`，读取时返回 `null`
 
 ### 3.3 特殊写入路径：initJWTSecret（绕过 JSON 序列化）
 
