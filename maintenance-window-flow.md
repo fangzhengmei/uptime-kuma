@@ -255,23 +255,165 @@ static async isUnderMaintenance(monitorID) {
 3. 支持监控组继承：如果父监控在维护中，子监控也视为在维护中
 4. 只要有一个维护窗口处于活动状态，返回 `true`
 
-### 3.3 维护状态的影响
+### 3.3 维护状态的影响：通知规则详解
 
-当监控处于维护状态时：
+维护状态对通知的影响由两个方法共同控制：`isImportantBeat()` 和 `isImportantForNotification()`。
 
-1. **不发送告警通知**：在 `isImportantForNotification()` 中，维护状态变化不会触发通知
-   ```javascript
-   // monitor.js:1003-1011
-   if (Monitor.isImportantForNotification(isFirstBeat, previousBeat?.status, bean.status)) {
-       log.debug("monitor", `[${this.name}] sendNotification`);
-       await Monitor.sendNotification(isFirstBeat, this, bean);
-   } else {
-       log.debug(
-           "monitor",
-           `[${this.name}] will not sendNotification because it is (or was) under maintenance`
-       );
-   }
-   ```
+#### 3.3.1 重要心跳判定：`isImportantBeat()`
+
+`isImportantBeat()` 决定心跳是否会被标记为 `important`（`monitor.js:1419-1445`）：
+
+```javascript
+static isImportantBeat(isFirstBeat, previousBeatStatus, currentBeatStatus) {
+    // * ? -> ANY STATUS = important [isFirstBeat]
+    // UP -> PENDING = not important
+    // * UP -> DOWN = important
+    // UP -> UP = not important
+    // PENDING -> PENDING = not important
+    // * PENDING -> DOWN = important
+    // PENDING -> UP = not important
+    // DOWN -> PENDING = this case not exists
+    // DOWN -> DOWN = not important
+    // * DOWN -> UP = important
+    // MAINTENANCE -> MAINTENANCE = not important
+    // * MAINTENANCE -> UP = important
+    // * MAINTENANCE -> DOWN = important
+    // * DOWN -> MAINTENANCE = important
+    // * UP -> MAINTENANCE = important
+    return (
+        isFirstBeat ||
+        (previousBeatStatus === DOWN && currentBeatStatus === MAINTENANCE) ||
+        (previousBeatStatus === UP && currentBeatStatus === MAINTENANCE) ||
+        (previousBeatStatus === MAINTENANCE && currentBeatStatus === DOWN) ||
+        (previousBeatStatus === MAINTENANCE && currentBeatStatus === UP) ||
+        (previousBeatStatus === UP && currentBeatStatus === DOWN) ||
+        (previousBeatStatus === DOWN && currentBeatStatus === UP) ||
+        (previousBeatStatus === PENDING && currentBeatStatus === DOWN)
+    );
+}
+```
+
+**涉及 MAINTENANCE 的重要状态变化：**
+
+| 变化类型 | 是否重要 | 说明 |
+|----------|----------|------|
+| `MAINTENANCE → MAINTENANCE` | ❌ 否 | 连续维护中，无状态变化 |
+| `MAINTENANCE → UP` | ✅ 是 | 维护结束，服务恢复 |
+| `MAINTENANCE → DOWN` | ✅ 是 | 维护结束，但服务故障（关键场景） |
+| `UP → MAINTENANCE` | ✅ 是 | 正常服务进入维护 |
+| `DOWN → MAINTENANCE` | ✅ 是 | 故障服务进入维护 |
+
+**重要心跳的影响：**
+- `bean.important = true`
+- 清除状态页缓存：`apicache.clear()`
+- 推送维护列表到前端：`sendMaintenanceListByUserID()`
+
+---
+
+#### 3.3.2 通知触发判定：`isImportantForNotification()`
+
+`isImportantForNotification()` 决定是否发送通知（`monitor.js:1454-1477`）：
+
+```javascript
+static isImportantForNotification(isFirstBeat, previousBeatStatus, currentBeatStatus) {
+    // * ? -> ANY STATUS = important [isFirstBeat]
+    // UP -> PENDING = not important
+    // * UP -> DOWN = important
+    // UP -> UP = not important
+    // PENDING -> PENDING = not important
+    // * PENDING -> DOWN = important
+    // PENDING -> UP = not important
+    // DOWN -> PENDING = this case not exists
+    // DOWN -> DOWN = not important
+    // * DOWN -> UP = important
+    // MAINTENANCE -> MAINTENANCE = not important
+    // MAINTENANCE -> UP = not important
+    // * MAINTENANCE -> DOWN = important
+    // DOWN -> MAINTENANCE = not important
+    // UP -> MAINTENANCE = not important
+    return (
+        isFirstBeat ||
+        (previousBeatStatus === MAINTENANCE && currentBeatStatus === DOWN) ||
+        (previousBeatStatus === UP && currentBeatStatus === DOWN) ||
+        (previousBeatStatus === DOWN && currentBeatStatus === UP) ||
+        (previousBeatStatus === PENDING && currentBeatStatus === DOWN)
+    );
+}
+```
+
+---
+
+#### 3.3.3 两种方法的对比与差异
+
+| 状态变化 | `isImportantBeat()` | `isImportantForNotification()` | 是否发送通知 |
+|----------|---------------------|-------------------------------|--------------|
+| `? → 任何状态` (isFirstBeat) | ✅ | ✅ | **是** |
+| `UP → DOWN` | ✅ | ✅ | **是** |
+| `PENDING → DOWN` | ✅ | ✅ | **是** |
+| `DOWN → UP` | ✅ | ✅ | **是** |
+| **`MAINTENANCE → DOWN`** | ✅ | ✅ | **是** |
+| `MAINTENANCE → UP` | ✅ | ❌ | **否** |
+| `UP → MAINTENANCE` | ✅ | ❌ | **否** |
+| `DOWN → MAINTENANCE` | ✅ | ❌ | **否** |
+| `MAINTENANCE → MAINTENANCE` | ❌ | ❌ | **否** |
+
+**关键发现：MAINTENANCE → DOWN 会发送通知！**
+
+这是维护窗口期间**唯一会发送通知**的状态变化。设计意图：
+- 维护期间服务被视为"计划内不可用"
+- 但**维护结束后**，如果服务仍然 DOWN，必须通知用户
+- 这是一个安全机制，确保维护结束时用户知道服务是否真的恢复
+
+---
+
+#### 3.3.4 首次心跳例外
+
+注意 `isFirstBeat` 参数：
+
+```javascript
+return (
+    isFirstBeat ||  // ⚠️ 首次心跳总是返回 true
+    // ... 其他条件
+);
+```
+
+**首次心跳规则：**
+- `isFirstBeat = true` 时，无论状态是什么，都返回 `true`
+- 这意味着监控首次创建时，即使处于维护状态，也可能触发通知
+
+但在 `sendNotification()` 中有额外检查：
+```javascript
+// monitor.js:1487
+if (!isFirstBeat || bean.status === DOWN) {
+    // 发送通知
+}
+```
+
+**实际行为：**
+- 首次心跳是 `DOWN`：✅ 发送通知
+- 首次心跳是 `UP`：❌ 不发送通知
+- 首次心跳是 `MAINTENANCE`：❌ 不发送通知
+
+---
+
+#### 3.3.5 通知场景矩阵
+
+| 场景 | 状态变化 | `isImportantBeat` | `isImportantForNotification` | 实际通知 |
+|------|----------|-------------------|------------------------------|----------|
+| 正常故障 | `UP → DOWN` | ✅ | ✅ | ✅ 发送 |
+| 正常恢复 | `DOWN → UP` | ✅ | ✅ | ✅ 发送 |
+| **进入维护（正常时）** | `UP → MAINTENANCE` | ✅ | ❌ | ❌ 不发送 |
+| **进入维护（故障时）** | `DOWN → MAINTENANCE` | ✅ | ❌ | ❌ 不发送 |
+| 连续维护 | `MAINTENANCE → MAINTENANCE` | ❌ | ❌ | ❌ 不发送 |
+| **维护结束正常恢复** | `MAINTENANCE → UP` | ✅ | ❌ | ❌ 不发送 |
+| **⚠️ 维护结束仍故障** | `MAINTENANCE → DOWN` | ✅ | ✅ | ✅ **发送（关键）** |
+| 首次心跳故障 | `? → DOWN` (firstBeat) | ✅ | ✅ | ✅ 发送 |
+| 首次心跳正常 | `? → UP` (firstBeat) | ✅ | ✅ | ❌ 不发送 |
+| 首次心跳维护 | `? → MAINTENANCE` (firstBeat) | ✅ | ✅ | ❌ 不发送 |
+
+---
+
+#### 3.3.6 其他影响
 
 2. **心跳记录标记维护**：心跳记录的 `status` 字段设置为 `MAINTENANCE`（值为 3）
 
@@ -664,15 +806,35 @@ static async getMaintenanceList(statusPageId) {
 
 ### 8.2 潜在注意事项
 
+#### 8.2.1 状态页优先级与边界条件
+
+1. **MAINTENANCE 优先级最高且短路返回**
+   - 代码：`if (beat.status === MAINTENANCE) return STATUS_PAGE_MAINTENANCE;`
+   - 行为：只要有一个监控的心跳是 MAINTENANCE，**立即退出循环**，后续监控的 UP/DOWN 完全不检查
+   - 边界：循环迭代顺序取决于 `for...in` 对对象属性的遍历顺序（JavaScript 中不可预测），但只要命中一次就结束
+
+2. **模板展示顺序 ≠ 实际优先级**
+   - 模板中 `v-if` 顺序：`allUp → partialDown → allDown → isMaintenance`
+   - 实际由 `overallStatus()` 决定优先级
+   - **不会出现**：维护中但显示故障的情况（因为维护中的监控心跳已是 MAINTENANCE，不会被当作 DOWN 处理）
+
+3. **维护期间无法看到实际故障**
+   - 维护中的监控心跳状态是 `MAINTENANCE`（值 3），不是 `UP`（1）或 `DOWN`（0）
+   - 即使服务在维护期间实际故障，心跳记录也是 `MAINTENANCE`
+   - `overallStatus()` 只能看到 `MAINTENANCE`，无法发现隐藏的故障
+
+#### 8.2.2 状态页两种展示机制的独立与联动
+
+| 边界场景 | 表现 | 说明 |
+|----------|------|------|
+| 监控在维护但未关联状态页 | 状态徽章显示"维护中"，但不显示维护卡片 | 可能让用户困惑：为什么显示维护但没有维护公告？ |
+| 状态页有关联维护窗口但监控不在维护 | 显示维护卡片，状态徽章根据实际状态 | 可用于"纯粹公告"场景，如提前告知即将进行维护 |
+| 部分监控在维护 | 状态徽章显示"维护中" | 只要有一个监控在维护，整体就显示维护中 |
+
+#### 8.2.3 其他注意事项
+
 1. **维护期间无实际探测**：维护结束后无法从心跳数据判断服务在维护期间的实际状态。如果需要确认维护期间服务状态，需要额外的验证机制。
 
-2. **状态页维护状态可能隐藏故障**：由于 MAINTENANCE 在 `overallStatus()` 中优先级最高，且维护中的监控心跳状态已是 MAINTENANCE，即使有监控实际故障，状态页也只会显示维护状态。
+2. **手动模式特性**：手动模式的维护窗口只要处于 active 状态，就会一直视为"维护中"。
 
-3. **状态页的两个独立触发条件**：
-   - 顶部维护信息卡片：只显示与状态页关联的维护窗口
-   - 整体状态徽章：只要状态页下的任何监控处于维护中就显示
-   - 可能出现：没有维护卡片但状态显示"维护中"的情况
-
-4. **手动模式特性**：手动模式的维护窗口只要处于 active 状态，就会一直视为"维护中"。
-
-5. **时区处理**：维护窗口支持自定义时区，需要注意 Cron 表达式与时区的匹配。
+3. **时区处理**：维护窗口支持自定义时区，需要注意 Cron 表达式与时区的匹配。
