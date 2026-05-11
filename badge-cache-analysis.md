@@ -119,20 +119,21 @@ apicache.options({
 
 ### 2.1 跨域处理差异
 
-#### 2.1.1 技术背景：SVG 徽章场景下的"资源可加载"与"脚本可读取"
+#### 2.1.1 技术背景：SVG 徽章场景下的"资源可加载"与"跨站脚本可读取"
 
 针对本题的 SVG 徽章场景，需要明确浏览器安全策略中两个关键行为的边界：
 
 | 场景 | 行为描述 | CORS 头要求 |
 |------|---------|------------|
 | **资源可加载（图片嵌入）** | 通过 `<img src="...">` 标签在页面中渲染显示 SVG 徽章图片 | **不需要** CORS 头 |
-| **脚本可读取** | 通过 JavaScript（fetch、XMLHttpRequest 等 API）获取 SVG 徽章的响应内容（SVG 字符串） | **需要** `Access-Control-Allow-Origin` 头 |
+| **跨站脚本可读取** | 通过跨站 JavaScript（fetch、XMLHttpRequest 等 API）获取 SVG 徽章的响应内容（SVG 字符串） | **需要** `Access-Control-Allow-Origin` 头 |
 
 **关键边界（针对 SVG 徽章）**：
 - 浏览器的同源策略（Same-Origin Policy）对不同资源类型有不同的限制规则
 - 对于 `<img>` 标签嵌入的图片资源，浏览器允许跨域加载并渲染，这是浏览器的基本功能
-- CORS（Cross-Origin Resource Sharing）机制是为**脚本发起的请求**设计的，控制脚本是否能读取跨域响应的内容
-- 因此：**SVG 徽章是否能被外站 `<img>` 嵌入展示，与 CORS 头无关；是否能被 JavaScript 读取，才取决于 CORS 头**
+- CORS（Cross-Origin Resource Sharing）机制是为**跨站脚本发起的请求**设计的，控制脚本是否能读取跨域响应的内容
+- 同源脚本始终可以读取同源资源的内容，不受 CORS 限制
+- 因此：**SVG 徽章是否能被外站 `<img>` 嵌入展示，与 CORS 头无关；是否能被跨站 JavaScript 读取，才取决于 CORS 头**
 
 基于代码证据的场景限定：
 - Uptime Kuma 的徽章端点返回 `Content-Type: image/svg+xml`，被浏览器识别为图片资源
