@@ -211,7 +211,110 @@ if (period <= 24) {
 
 #### 3.3.1 实时模式（`getChartDatapointsFromHeartbeatList`，行 352-440）
 
-**特点：** 无降采样，直接使用原始心跳数据
+**数据来源：** `this.$root.heartbeatList[monitorId]`
+
+**特点：** 名义上"无降采样"，但受双重上限约束，实际上是有限数据点的直接展示。
+
+##### 双重数据上限机制
+
+**第一重：服务端查询限制**（`server/client.js:sendHeartbeatList()`，行 46-64）
+
+```sql
+SELECT * FROM heartbeat
+WHERE monitor_id = ?
+ORDER BY time DESC
+LIMIT 100
+```
+
+- 初始加载时，服务端从数据库查询最近 **100 条** 心跳
+- 按时间倒序查询后反转，形成正序列表发送给客户端
+
+**第二重：客户端内存限制**（`src/mixins/socket.js`，行 204-213）
+
+```javascript
+socket.on("heartbeat", (data) => {
+    if (!(data.monitorID in this.heartbeatList)) {
+        this.heartbeatList[data.monitorID] = [];
+    }
+
+    this.heartbeatList[data.monitorID].push(data);
+
+    if (this.heartbeatList[data.monitorID].length >= 150) {
+        this.heartbeatList[data.monitorID].shift();
+    }
+});
+```
+
+- 每次新心跳到达时追加到列表
+- 当列表长度达到 **150** 时，移除最早的一条（FIFO 队列）
+- 这是一个滑动窗口，始终保留最近 150 条心跳
+
+##### 实际数据量分析
+
+| 阶段 | 数据来源 | 最大条数 | 说明 |
+|------|---------|---------|------|
+| 页面刚加载 | `sendHeartbeatList` | 100 | 数据库中最近 100 条 |
+| 运行一段时间 | 实时推送 + 150 上限 | 150 | 初始 100 条 + 新增 50 条后开始移除旧数据 |
+| 长期运行 | 滑动窗口 | 150 | 始终保持最近 150 条 |
+
+##### 对"无降采样"判断的影响
+
+**代码层面的判断：**
+
+在 `PingChart.vue:217-223`：
+```javascript
+chartData() {
+    if (this.chartPeriodHrs === "0") {
+        return this.getChartDatapointsFromHeartbeatList();
+    } else {
+        return this.getChartDatapointsFromStats();
+    }
+}
+```
+
+`getChartDatapointsFromHeartbeatList()` 方法内部：
+```javascript
+getChartDatapointsFromHeartbeatList() {
+    let heartbeatList =
+        (this.monitorId in this.$root.heartbeatList && this.$root.heartbeatList[this.monitorId]) || [];
+
+    for (const beat of heartbeatList) {
+        // 直接遍历每一条心跳，没有任何聚合逻辑
+        // 逐条 push 到 pingData 和 downData
+    }
+}
+```
+
+**实际含义分析：**
+
+1. **算法层面**：确实"无降采样"
+   - 没有滑动窗口聚合
+   - 没有平均值计算
+   - 没有数据点合并
+   - 每条心跳在 `heartbeatList` 中存在就会在图表中显示
+
+2. **数据层面**：实际上是"截断采样"
+   - 150 条硬限制意味着超过 150 条的历史数据会被丢弃
+   - 这不是智能降采样（保留特征点），而是简单的尾部截断
+   - 对于高频监控（如 30 秒间隔），150 条仅覆盖约 75 分钟
+
+3. **与统计模式的本质区别：**
+
+| 对比项 | Recent 模式 | 统计模式（3h/6h/24h） |
+|-------|------------|---------------------|
+| 数据粒度 | 原始心跳 | 分钟/小时聚合 |
+| 时间覆盖 | 取决于监控频率和 150 上限 | 固定时间窗口 |
+| 聚合算法 | 无（直接展示） | 滑动窗口 + 平均值 |
+| DOWN 状态 | 每条单独显示 | 可能与相邻 UP 聚合 |
+| Ping 统计 | 单次 ping 值 | avg/min/max |
+
+4. **潜在的信息丢失：**
+
+例如，监控间隔 20 秒，运行 2 小时后：
+- 产生心跳数：3600/20 × 2 = 360 条
+- 实际保留：150 条（最近 50 分钟）
+- 丢失：前 70 分钟的 210 条心跳
+- 图表显示范围：约 50 分钟，而非"最近"的完整 2 小时
 
 **处理逻辑：**
 - 遍历 `heartbeatList`（Socket 实时推送的最近心跳）
