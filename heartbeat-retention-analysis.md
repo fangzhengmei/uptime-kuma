@@ -227,7 +227,9 @@ LIMIT 100
 ```
 
 - 初始加载时，服务端从数据库查询最近 **100 条** 心跳
-- 按时间倒序查询后反转，形成正序列表发送给客户端
+- `ORDER BY time DESC LIMIT 100`: 按时间倒序取最新的 100 条
+- `list.reverse()`: 查询结果反转，形成从旧到新的正序列表
+- 实际发送条数：**恰好 100 条**（如果数据库中有足够数据）
 
 **第二重：客户端内存限制**（`src/mixins/socket.js`，行 204-213）
 
@@ -245,17 +247,40 @@ socket.on("heartbeat", (data) => {
 });
 ```
 
-- 每次新心跳到达时追加到列表
-- 当列表长度达到 **150** 时，移除最早的一条（FIFO 队列）
-- 这是一个滑动窗口，始终保留最近 150 条心跳
+**代码逻辑精确分析：**
 
-##### 实际数据量分析
+1. `push(data)`: 每次新心跳到达时追加到列表尾部
+2. `length >= 150`: 判断条件是"大于等于"而非"大于"
+3. `shift()`: 移除列表的第一个元素（最早的一条）
 
-| 阶段 | 数据来源 | 最大条数 | 说明 |
+**达到上限时的实际保留数量：**
+
+| 操作步骤 | 列表长度 | 说明 |
+|---------|---------|------|
+| 初始状态（刚加载） | 100 | 来自 `sendHeartbeatList` 的 100 条 |
+| 第 1 条新心跳 push | 101 | `101 >= 150` 为 false，不移除 |
+| 第 50 条新心跳 push | 150 | `150 >= 150` 为 true，执行 shift |
+| shift 后 | **149** | 移除最早的 1 条，实际保留 149 条 |
+| 第 51 条新心跳 push | 150 | `150 >= 150` 为 true，执行 shift |
+| shift 后 | **149** | 保持 149 条 |
+
+**关键结论：达到上限时实际保留 149 条，而非 150 条。**
+
+原因：`push()` 先将长度增加到 150，然后 `shift()` 立即移除 1 条，最终长度为 149。
+
+##### 实际数据量完整分析
+
+| 阶段 | 数据来源 | 列表长度 | 说明 |
 |------|---------|---------|------|
 | 页面刚加载 | `sendHeartbeatList` | 100 | 数据库中最近 100 条 |
-| 运行一段时间 | 实时推送 + 150 上限 | 150 | 初始 100 条 + 新增 50 条后开始移除旧数据 |
-| 长期运行 | 滑动窗口 | 150 | 始终保持最近 150 条 |
+| 新增 1-49 条心跳 | 实时推送 | 101-149 | 未达到 150 阈值，不触发移除 |
+| 新增第 50 条心跳 | push 后 length=150 | **149** | 触发 shift，实际保留 149 条 |
+| 长期运行 | 滑动窗口 | **149** | 每次 push 后立即 shift，始终保持 149 条 |
+
+**特殊情况：**
+- 如果数据库中心跳不足 100 条，初始加载条数 = 实际心跳数
+- 如果监控刚创建且没有历史心跳，初始列表为空
+- 页面刷新后重新从数据库加载，重置为 100 条（或实际条数）
 
 ##### 对"无降采样"判断的影响
 
@@ -488,7 +513,250 @@ VACUUM;  -- 重建数据库文件，回收未使用空间
 
 ---
 
-## 6. 文件索引
+## 6. 监控长期停更时的表现
+
+### 6.1 停更场景定义
+
+**监控停更**指监控暂停或长时间不产生新心跳的情况，包括：
+- 用户手动暂停监控（`active=false`）
+- Push 类型监控长时间未推送数据
+- 监控配置错误导致无法执行
+- 服务器异常导致监控任务中断
+
+### 6.2 对数据清理的影响
+
+#### 6.2.1 聚合统计数据
+
+**清理延迟问题：**
+
+如 2.3.4 节所述，`stat_minutely` 和 `stat_hourly` 的清理仅在 `update()` 调用时触发。
+
+**时间线示例（监控间隔 60 秒，3月1日开始停更）：**
+
+| 日期 | 事件 | `stat_minutely` 数据状态 | `stat_hourly` 数据状态 |
+|------|------|------------------------|-----------------------|
+| 3月1日 | 监控最后一次心跳 | 保留最近 24 小时数据 | 保留最近 30 天数据 |
+| 3月2日 | 停更第 1 天 | 24小时前的数据**未清理** | 正常 |
+| 3月31日 | 停更第 30 天 | 全部数据**未清理** | 30天前的数据**未清理** |
+| 4月1日 | 监控恢复运行，第一次心跳 | **立即清理全部过期数据** | **立即清理全部过期数据** |
+
+**与定时任务的对比：**
+
+`stat_daily` 和 `heartbeat` 表的清理由定时任务（每天 03:14）执行，不受监控是否运行影响。
+
+#### 6.2.2 原始心跳数据
+
+**受定时任务保护：**
+
+即使监控停更，定时任务仍会按 `keepDataPeriodDays` 配置清理过期心跳。
+
+```
+keepDataPeriodDays = 365（默认）
+监控于 2025-01-01 停更
+2026-01-02 的定时任务会清理 2025-01-01 及之前的所有心跳
+```
+
+### 6.3 对图表展示的影响
+
+#### 6.3.1 Recent 模式（`chartPeriodHrs = "0"`）
+
+**数据来源：** `heartbeatList`（客户端内存中的最近心跳）
+
+**停更后的表现：**
+
+1. **Socket 重连时的数据丢失：**
+   - 重连时调用 `sendHeartbeatList()` 从数据库查询最近 100 条
+   - 如果监控已停更超过 24 小时且 `important=0` 的心跳已被清理
+   - 可能返回空列表或仅包含少量 `important=true` 的心跳
+
+2. **客户端内存限制：**
+   - 页面未刷新时：`heartbeatList` 保留最多 150 条历史数据
+   - 页面刷新或重连后：从数据库重新加载，可能丢失更多数据
+
+3. **图表表现：**
+   - 图表显示最后一次心跳的时间点
+   - 之后没有新数据点，图表"冻结"在停更时刻
+   - 不会显示"监控已停止"的明确提示
+
+#### 6.3.2 统计模式（3h/6h/24h/1w）
+
+**数据来源：** `UptimeCalculator.getDataArray()`
+
+**UptimeCalculator 初始化行为：** `server/uptime-calculator.js:72-82`
+
+```javascript
+static async getUptimeCalculator(monitorID) {
+    if (!monitorID) {
+        throw new Error("Monitor ID is required");
+    }
+
+    if (!UptimeCalculator.list[monitorID]) {
+        UptimeCalculator.list[monitorID] = new UptimeCalculator();
+        await UptimeCalculator.list[monitorID].init(monitorID);
+    }
+    return UptimeCalculator.list[monitorID];
+}
+```
+
+**`init()` 方法的数据加载：** `server/uptime-calculator.js:123-203`
+
+```javascript
+async init(monitorID) {
+    let now = this.getCurrentDate();
+
+    // 加载最近 24 小时的分钟级统计
+    let minutelyStatBeans = await R.find("stat_minutely", 
+        " monitor_id = ? AND timestamp > ? ORDER BY timestamp", [
+        monitorID,
+        this.getMinutelyKey(now.subtract(24, "hour")),
+    ]);
+
+    // 加载最近 30 天的小时级统计
+    let hourlyStatBeans = await R.find("stat_hourly", 
+        " monitor_id = ? AND timestamp > ? ORDER BY timestamp", [
+        monitorID,
+        this.getHourlyKey(now.subtract(30, "day")),
+    ]);
+
+    // 加载最近 365 天的天级统计
+    let dailyStatBeans = await R.find("stat_daily", 
+        " monitor_id = ? AND timestamp > ? ORDER BY timestamp", [
+        monitorID,
+        this.getDailyKey(now.subtract(365, "day")),
+    ]);
+}
+```
+
+**停更后的数据加载：**
+
+| 图表周期 | 查询条件 | 停更 25 小时后 | 停更 31 天后 |
+|---------|---------|--------------|-------------|
+| 3h/6h/24h | `timestamp > now - 24h` | `stat_minutely` 中无符合条件的数据 | 空数据 |
+| 1w (168h) | `timestamp > now - 30d` | 有数据（小时级） | `stat_hourly` 中无符合条件的数据 |
+| 更长周期 | 天级统计 | 有数据 | 有数据（直到 `keepDataPeriodDays`） |
+
+**图表表现：**
+
+1. **24 小时内的周期（3h/6h/24h）：**
+   - 停更超过 24 小时后，`stat_minutely` 中没有 `timestamp > now - 24h` 的数据
+   - 图表可能显示为空或只有很少的数据点
+   - 即使数据库中还有旧的 `stat_minutely` 数据（因清理延迟未删除），也不会被查询到
+
+2. **1 周周期：**
+   - 停更 30 天内仍可看到小时级聚合数据
+   - 超过 30 天后，`stat_hourly` 查询结果为空
+   - 图表显示为空白
+
+3. **数据"老化"现象：**
+   - `getDataArray()` 从"当前时间"向前追溯
+   - 监控停更后，数据点的时间戳越来越"旧"
+   - 最终超出查询时间窗口，图表变为空白
+
+**实际示例：**
+
+```
+监控最后心跳：2026-05-01 12:00:00
+监控间隔：60 秒
+
+2026-05-01 13:00（停更 1 小时）：
+  - 3h 图表：显示 10:00-13:00 的数据，最后 1 小时无新数据
+  - 24h 图表：显示完整 24 小时数据
+
+2026-05-02 13:00（停更 25 小时）：
+  - 3h/6h/24h 图表：stat_minutely 查询 timestamp > now-24h
+  - 最后一条 stat_minutely 数据在 2026-05-01 12:00
+  - now-24h = 2026-05-01 13:00
+  - 查询结果为空，图表显示空白
+
+2026-05-02 13:00 查看 1w 图表：
+  - 使用 stat_hourly，查询 timestamp > now-30d
+  - 仍有数据，图表正常显示
+
+2026-06-01 13:00（停更 31 天）查看 1w 图表：
+  - stat_hourly 查询 timestamp > now-30d
+  - 最后一条 stat_hourly 数据在 2026-05-01 12:00
+  - 查询结果为空，图表显示空白
+```
+
+### 6.4 对可用性计算的影响
+
+**`UptimeCalculator.getData()` 方法：** `server/uptime-calculator.js:563-688`
+
+```javascript
+getData(num, type = "day") {
+    // 从当前时间向前追溯
+    let key = this.getKey(this.getCurrentDate(), type);
+    
+    // 计算结束时间戳
+    switch (type) {
+        case "day":
+            endTimestamp = key - 86400 * (num - 1);
+            break;
+        case "hour":
+            endTimestamp = key - 3600 * (num - 1);
+            break;
+        case "minute":
+            endTimestamp = key - 60 * (num - 1);
+            break;
+    }
+
+    // 遍历时间窗口内的数据
+    while (key >= endTimestamp) {
+        // 从对应队列获取数据
+        let data = this.dailyUptimeDataList[key];  // 或 hourly/minutely
+        
+        if (data) {
+            total.up += data.up;
+            total.down += data.down;
+        }
+        key -= 时间间隔;
+    }
+
+    // 无数据时的回退逻辑
+    if (total.up === 0 && total.down === 0) {
+        // 尝试使用 lastDailyUptimeData / lastHourlyUptimeData / lastUptimeData
+        if (this.lastDailyUptimeData) {
+            total = this.lastDailyUptimeData;
+        }
+    }
+}
+```
+
+**停更后的可用性计算：**
+
+1. **时间窗口内无数据：**
+   - `total.up = 0` 且 `total.down = 0`
+   - 触发回退逻辑，使用 `last*UptimeData`
+   - 如果 `last*UptimeData` 也不存在，返回空结果
+
+2. **`lastUptimeData` 的更新：** `server/uptime-calculator.js:284-294`
+   ```javascript
+   if (minutelyData !== this.lastUptimeData) {
+       this.lastUptimeData = minutelyData;
+   }
+   ```
+   - 仅在数据实际变化时更新
+   - 监控停更后保持最后一次的值
+
+3. **实际表现：**
+   - 短时间停更：可用性计算可能使用最后已知数据
+   - 长时间停更：所有数据超出时间窗口，可用性可能显示为 0 或异常值
+
+### 6.5 完整停更时间线示例
+
+**场景：** 监控间隔 60 秒，2026-05-01 12:00 开始停更，`keepDataPeriodDays = 365`
+
+| 时间点 | Recent 模式 | 24h 图表 | 1w 图表 | 数据清理状态 |
+|-------|------------|---------|---------|-------------|
+| 5月1日 13:00 | 显示最近心跳，停更后无新数据 | 正常（含停更前数据） | 正常 | 无清理触发 |
+| 5月2日 13:00 | 页面刷新后可能数据减少 | **空白**（24h 窗口内无数据） | 正常 | `stat_minutely` 旧数据仍在数据库（未触发清理） |
+| 5月3日 03:14 | 定时任务清理 24h 前的非重要心跳 | 空白 | 正常 | 非重要心跳被清理 |
+| 6月1日 12:00 | 数据更少（重要心跳 + 最近 100 条） | 空白 | **空白**（30d 窗口内无数据） | `stat_hourly` 旧数据仍在数据库 |
+| 2027年5月2日 03:14 | 数据库中心跳已全部清理 | 空白 | 空白 | 定时任务清理所有过期数据 |
+
+---
+
+## 7. 文件索引
 
 | 功能模块 | 主要文件 | 关键方法/行号 |
 |---------|---------|--------------|
