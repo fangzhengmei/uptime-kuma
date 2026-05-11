@@ -1,222 +1,48 @@
 # Uptime Kuma 备份导入导出流程分析
 
-## 1. 概述
+## 1. 备份能力状态确认
 
-Uptime Kuma 的备份导入导出功能是基于 Socket.io 事件实现的。系统通过精心设计的数据模型和序列化机制来保护敏感配置信息，确保在数据导出和传输过程中的安全性。
+### 1.1 当前仓库状态
 
-## 2. 架构概览
+经过对代码库的全面搜索，**当前仓库中没有完整可用的备份功能**：
 
-### 2.1 备份功能位置
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 备份导出 | ❌ 不存在 | 无 `downloadBackup`、`exportBackup`、`getBackup` 等相关代码 |
+| 备份导入 | ⚠️ 前端存根 | 前端有 `uploadBackup` 方法，但后端无对应 handler |
 
-- **前端触发**: `src/mixins/socket.js` 中的 `uploadBackup()` 方法
-- **数据来源**: 前端通过 Socket.io 从服务器获取各类数据
-- **数据模型**: 核心模型位于 `server/model/` 目录
+### 1.2 代码证据
 
-### 2.2 数据传输机制
-
-系统使用 Socket.io 进行实时数据传输，主要数据类型包括：
-- 监控器列表 (monitorList)
-- 通知配置列表 (notificationList)
-- 代理配置列表 (proxyList)
-- API 密钥列表 (apiKeyList)
-- 维护计划列表 (maintenanceList)
-- 状态页面配置 (statusPageList)
-
-## 3. 敏感数据保护机制
-
-### 3.1 监控器模型 (Monitor)
-
-**文件位置**: `server/model/monitor.js`
-
-#### 3.1.1 核心保护方法
-
-监控器模型提供了三个关键的序列化方法：
-
-1. **`toPublicJSON(showTags, certExpiry)`** - 用于公开状态页面的最小化数据
-2. **`toJSON(preloadData, includeSensitiveData)`** - 用于内部使用的完整数据
-3. **`includeSensitiveData`** 标志控制敏感字段的暴露
-
-#### 3.1.2 敏感字段列表
-
-当 `includeSensitiveData = false` 时，以下字段会被**排除**：
-
-| 字段名 | 描述 | 用途 |
-|--------|------|------|
-| `headers` | HTTP 请求头 | 自定义 HTTP 头信息 |
-| `body` | HTTP 请求体 | POST/PUT 请求数据 |
-| `grpcBody` | gRPC 请求体 | gRPC 服务请求数据 |
-| `grpcMetadata` | gRPC 元数据 | gRPC 认证和元数据 |
-| `basic_auth_user` | 基础认证用户名 | HTTP Basic Auth 用户名 |
-| `basic_auth_pass` | 基础认证密码 | HTTP Basic Auth 密码 |
-| `oauth_client_id` | OAuth 客户端 ID | OAuth 2.0 认证 |
-| `oauth_client_secret` | OAuth 客户端密钥 | OAuth 2.0 认证 |
-| `oauth_token_url` | OAuth Token URL | OAuth 2.0 认证地址 |
-| `oauth_scopes` | OAuth 权限范围 | OAuth 2.0 权限 |
-| `oauth_audience` | OAuth 受众 | OAuth 2.0 受众标识 |
-| `oauth_auth_method` | OAuth 认证方法 | OAuth 2.0 认证方式 |
-| `pushToken` | Push 监控 Token | 被动监控的认证令牌 |
-| `databaseConnectionString` | 数据库连接字符串 | 数据库监控的连接信息 |
-| `radiusUsername` | RADIUS 用户名 | RADIUS 认证监控 |
-| `radiusPassword` | RADIUS 密码 | RADIUS 认证监控 |
-| `radiusSecret` | RADIUS 共享密钥 | RADIUS 协议密钥 |
-| `mqttUsername` | MQTT 用户名 | MQTT 监控认证 |
-| `mqttPassword` | MQTT 密码 | MQTT 监控认证 |
-| `mqttWebsocketPath` | MQTT WebSocket 路径 | MQTT 连接配置 |
-| `authWorkstation` | NTLM 认证工作站 | Windows 认证 |
-| `authDomain` | NTLM 认证域 | Windows 域认证 |
-| `tlsCa` | TLS CA 证书 | TLS/SSL 认证 |
-| `tlsCert` | TLS 客户端证书 | TLS/SSL 认证 |
-| `tlsKey` | TLS 私钥 | TLS/SSL 认证 |
-| `kafkaProducerSaslOptions` | Kafka SASL 配置 | Kafka 安全认证 |
-| `rabbitmqUsername` | RabbitMQ 用户名 | RabbitMQ 监控认证 |
-| `rabbitmqPassword` | RabbitMQ 密码 | RabbitMQ 监控认证 |
-
-#### 3.1.3 非敏感字段（始终包含）
-
-以下字段无论 `includeSensitiveData` 如何设置都会包含：
-- 基础信息: `id`, `name`, `description`, `type`, `url`, `interval`
-- 状态信息: `active`, `forceInactive`, `maxretries`, `timeout`
-- 标签和分组: `tags`, `notificationIDList`, `maintenance`
-- 协议配置: `method`, `hostname`, `port`, `protocol`
-
-### 3.2 API 密钥模型 (APIKey)
-
-**文件位置**: `server/model/api_key.js`
-
-#### 3.2.1 保护策略
-
-API 密钥模型采用了两层保护：
-
-1. **`toJSON()`** - 包含完整密钥（仅在创建时使用一次）
-2. **`toPublicJSON()`** - 移除密钥值，仅保留元数据
-
-#### 3.2.2 字段对比
-
-| 字段 | toJSON() | toPublicJSON() | 说明 |
-|------|----------|----------------|------|
-| `id` | ✅ | ✅ | 数据库 ID |
-| `name` | ✅ | ✅ | 密钥名称 |
-| `key` | ✅ | ❌ | 实际密钥值（敏感） |
-| `userID` | ✅ | ✅ | 所属用户 |
-| `createdDate` | ✅ | ✅ | 创建日期 |
-| `active` | ✅ | ✅ | 激活状态 |
-| `expires` | ✅ | ✅ | 过期时间 |
-| `status` | ✅ | ✅ | 当前状态 |
-
-#### 3.2.3 发送到客户端的处理
-
-在 `server/client.js` 的 `sendAPIKeyList()` 方法中：
-
+**前端存根方法** - `src/mixins/socket.js:679-681`:
 ```javascript
-async function sendAPIKeyList(socket) {
-    let result = [];
-    const list = await R.find("api_key", "user_id=?", [socket.userID]);
-
-    for (let bean of list) {
-        result.push(bean.toPublicJSON());  // 使用 toPublicJSON 移除密钥
-    }
-
-    io.to(socket.userID).emit("apiKeyList", result);
+uploadBackup(uploadedJSON, importHandle, callback) {
+    socket.emit("uploadBackup", uploadedJSON, importHandle, callback);
 }
 ```
 
-### 3.3 通知配置模型 (Notification)
+**后端 Socket Handler 完整列表** - `server/server.js` 和 `server/socket-handlers/`:
+- `login`, `logout`, `prepare2FA`, `save2FA` 等认证相关
+- `add`, `editMonitor`, `deleteMonitor` 等监控器管理
+- `addNotification`, `deleteNotification` 等通知管理
+- `addAPIKey`, `getAPIKeyList`, `deleteAPIKey` 等 API 密钥管理
+- **无 `uploadBackup` handler**
 
-**文件位置**: `server/notification.js`
+### 1.3 结论
 
-#### 3.3.1 存储机制
+当前代码库的备份功能处于**未完成状态**：
+- 前端保留了调用接口的存根
+- 后端没有对应的实现逻辑
+- 实际的数据备份操作需要通过其他方式（如直接导出数据库）
 
-通知配置存储在 `notification` 表的 `config` 字段中，采用 JSON 字符串格式：
+---
 
-```javascript
-bean.config = JSON.stringify(notification);
-```
+## 2. 登录后数据同步流程（误判为备份导出的机制）
 
-#### 3.3.2 敏感字段
+### 2.1 核心同步函数
 
-通知配置包含多种通知提供商的敏感信息，包括但不限于：
+用户登录后，系统通过 `afterLogin()` 函数同步所有用户数据：
 
-| 通知类型 | 敏感字段示例 |
-|----------|--------------|
-| Webhook | Webhook URL、认证令牌 |
-| Telegram | Bot Token |
-| Slack | Webhook URL |
-| Email (SMTP) | SMTP 密码、API Key |
-| 短信服务 | API Key、Secret |
-| Teams | Webhook URL |
-
-#### 3.3.3 传输到客户端
-
-在 `server/client.js` 中，通知使用 RedBeanNode 的 `export()` 方法：
-
-```javascript
-async function sendNotificationList(socket) {
-    let result = [];
-    let list = await R.find("notification", " user_id = ? ", [socket.userID]);
-
-    for (let bean of list) {
-        let notificationObject = bean.export();  // 导出所有字段
-        // ... 处理布尔值转换
-        result.push(notificationObject);
-    }
-
-    io.to(socket.userID).emit("notificationList", result);
-}
-```
-
-**注意**: RedBeanNode 的 `export()` 方法会导出所有数据库字段，包括包含敏感配置的 `config` 字段。这意味着通知的完整配置（包括密钥和密码）会被发送到已登录用户的前端。
-
-### 3.4 状态页面模型 (StatusPage)
-
-**文件位置**: `server/model/status_page.js`
-
-#### 3.4.1 公开和私有数据分离
-
-状态页面提供了两个序列化方法：
-
-1. **`toJSON()`** - 管理后台使用的完整数据
-2. **`toPublicJSON()`** - 公开访问使用的最小化数据
-
-#### 3.4.2 字段对比
-
-| 字段 | toJSON() | toPublicJSON() | 说明 |
-|------|----------|----------------|------|
-| `id` | ✅ | ❌ | 数据库 ID（内部使用） |
-| `slug` | ✅ | ✅ | URL 友好标识符 |
-| `title` | ✅ | ✅ | 页面标题 |
-| `description` | ✅ | ✅ | 页面描述 |
-| `icon` | ✅ | ✅ | 图标 |
-| `theme` | ✅ | ✅ | 主题设置 |
-| `published` | ✅ | ✅ | 发布状态 |
-| `domainNameList` | ✅ | ❌ | 自定义域名（内部管理） |
-
-### 3.5 其他模型
-
-#### 3.5.1 维护计划 (Maintenance)
-
-**文件位置**: `server/model/maintenance.js`
-
-- `toPublicJSON()` - 用于状态页面的公开数据
-- `toJSON()` - 完整的管理数据
-
-#### 3.5.2 心跳记录 (Heartbeat)
-
-**文件位置**: `server/model/heartbeat.js`
-
-- `toPublicJSON()` - 移除敏感的响应体信息
-- `toJSON()` / `toJSONAsync()` - 完整数据，用于调试和管理
-
-#### 3.5.3 事件记录 (Incident)
-
-**文件位置**: `server/model/incident.js`
-
-- `toPublicJSON()` - 公开显示的事件信息
-
-## 4. 数据流向分析
-
-### 4.1 登录后数据同步流程
-
-用户登录后，系统通过 `afterLogin()` 函数（`server/server.js:1804`）发送所有必要数据：
+**位置**: `server/server.js:1804-1836`
 
 ```javascript
 async function afterLogin(socket, user) {
@@ -227,121 +53,527 @@ async function afterLogin(socket, user) {
     await Promise.allSettled([
         sendInfo(socket),
         server.sendMaintenanceList(socket),
-        sendNotificationList(socket),      // 包含完整通知配置
+        sendNotificationList(socket),
         sendProxyList(socket),
         sendDockerHostList(socket),
-        sendAPIKeyList(socket),            // 使用 toPublicJSON，无密钥
+        sendAPIKeyList(socket),
         sendRemoteBrowserList(socket),
         sendMonitorTypeList(socket),
     ]);
+
+    await StatusPage.sendStatusPageList(io, socket);
+    // ... 发送心跳历史等
 }
 ```
 
-### 4.2 监控器列表获取
+### 2.2 数据同步边界
 
-**位置**: `server/uptime-kuma-server.js:256-277`
+所有发送到前端的数据都通过 **Socket.io** 通道，且**仅发送给已认证用户**：
+
+1. **认证检查**: 所有数据操作前调用 `checkLogin(socket)`
+2. **用户隔离**: 数据库查询通过 `user_id = ?` 条件过滤
+3. **Socket 房间**: 登录后加入 `user.id` 房间，消息仅发送到该房间
+
+---
+
+## 3. 导出包含的敏感字段
+
+### 3.1 监控器 (Monitor) 敏感字段
+
+**位置**: `server/model/monitor.js:117-254`
+
+监控器的 `toJSON()` 方法通过 `includeSensitiveData` 参数控制敏感字段暴露：
 
 ```javascript
-async getMonitorJSONList(userID, monitorID = null) {
-    // ... 查询数据库 ...
-    monitorList.forEach((monitor) => (
-        result[monitor.id] = monitor.toJSON(preloadData)  // includeSensitiveData = true
-    ));
-    return result;
+toJSON(preloadData = {}, includeSensitiveData = true) {
+    // 基础数据（始终包含）
+    let data = {
+        id: this.id, name: this.name, description: this.description,
+        url: this.url, type: this.type, interval: this.interval,
+        // ... 其他非敏感字段
+    };
+
+    if (includeSensitiveData) {
+        data = {
+            ...data,
+            headers: this.headers,
+            body: this.body,
+            grpcBody: this.grpcBody,
+            grpcMetadata: this.grpcMetadata,
+            basic_auth_user: this.basic_auth_user,
+            basic_auth_pass: this.basic_auth_pass,
+            oauth_client_id: this.oauth_client_id,
+            oauth_client_secret: this.oauth_client_secret,
+            oauth_token_url: this.oauth_token_url,
+            oauth_scopes: this.oauth_scopes,
+            oauth_audience: this.oauth_audience,
+            oauth_auth_method: this.oauth_auth_method,
+            pushToken: this.pushToken,
+            databaseConnectionString: this.databaseConnectionString,
+            radiusUsername: this.radiusUsername,
+            radiusPassword: this.radiusPassword,
+            radiusSecret: this.radiusSecret,
+            mqttUsername: this.mqttUsername,
+            mqttPassword: this.mqttPassword,
+            mqttWebsocketPath: this.mqttWebsocketPath,
+            authWorkstation: this.authWorkstation,
+            authDomain: this.authDomain,
+            tlsCa: this.tlsCa,
+            tlsCert: this.tlsCert,
+            tlsKey: this.tlsKey,
+            kafkaProducerSaslOptions: JSON.parse(this.kafkaProducerSaslOptions),
+            rabbitmqUsername: this.rabbitmqUsername,
+            rabbitmqPassword: this.rabbitmqPassword,
+        };
+    }
+
+    data.includeSensitiveData = includeSensitiveData;
+    return data;
 }
 ```
 
-**关键发现**: 
-- 默认情况下，`toJSON()` 的第二个参数 `includeSensitiveData` 默认为 `true`
-- 这意味着监控器的完整敏感配置会被发送到已登录用户的前端
+### 3.2 监控器敏感字段分类
 
-### 4.3 单个监控器获取
+| 类别 | 字段 | 敏感度 | 说明 |
+|------|------|--------|------|
+| HTTP 认证 | `basic_auth_user`, `basic_auth_pass` | 高 | HTTP Basic Auth 凭证 |
+| OAuth 2.0 | `oauth_client_id`, `oauth_client_secret`, `oauth_token_url`, `oauth_scopes`, `oauth_audience`, `oauth_auth_method` | 高 | OAuth 认证完整配置 |
+| HTTP 自定义 | `headers`, `body`, `grpcBody`, `grpcMetadata` | 中 | 可能包含认证 Token |
+| 数据库 | `databaseConnectionString` | 极高 | 完整连接字符串含密码 |
+| RADIUS | `radiusUsername`, `radiusPassword`, `radiusSecret` | 高 | RADIUS 认证完整信息 |
+| MQTT | `mqttUsername`, `mqttPassword`, `mqttWebsocketPath` | 高 | MQTT 连接认证 |
+| TLS/SSL | `tlsCa`, `tlsCert`, `tlsKey` | 极高 | 证书和私钥 |
+| Windows 认证 | `authWorkstation`, `authDomain` | 中 | NTLM/Kerberos 相关 |
+| Kafka | `kafkaProducerSaslOptions` | 高 | SASL 认证配置 |
+| RabbitMQ | `rabbitmqUsername`, `rabbitmqPassword` | 高 | RabbitMQ 连接凭证 |
+| Push Token | `pushToken` | 高 | 被动监控的认证令牌 |
 
-**位置**: `server/server.js:987-1006`
+### 3.3 API 密钥 (APIKey) 敏感字段
+
+**位置**: `server/model/api_key.js:24-52`
 
 ```javascript
-socket.on("getMonitor", async (monitorID, callback) => {
+toJSON() {
+    return {
+        id: this.id,
+        key: this.key,        // 完整密钥
+        name: this.name,
+        userID: this.user_id,
+        createdDate: this.created_date,
+        active: this.active,
+        expires: this.expires,
+        status: this.getStatus(),
+    };
+}
+
+toPublicJSON() {
+    return {
+        id: this.id,
+        // key: this.key,      // 已移除
+        name: this.name,
+        userID: this.user_id,
+        createdDate: this.created_date,
+        active: this.active,
+        expires: this.expires,
+        status: this.getStatus(),
+    };
+}
+```
+
+### 3.4 通知配置 (Notification) 敏感字段
+
+**位置**: `server/notification.js:260-264`
+
+```javascript
+bean.name = notification.name;
+bean.user_id = userID;
+bean.config = JSON.stringify(notification);  // 完整配置 JSON 化存储
+bean.is_default = notification.isDefault || false;
+```
+
+通知配置的 `config` 字段包含**完整的通知提供商配置**，根据不同通知类型可能包含：
+
+| 通知类型 | 可能包含的敏感字段 |
+|----------|-------------------|
+| Webhook | Webhook URL, Auth Token, Header 认证 |
+| Telegram | Bot Token |
+| Slack / Discord | Webhook URL |
+| Email (SMTP) | SMTP Host, Port, Username, Password |
+| Twilio | Account SID, Auth Token, Phone Number |
+| Teams | Webhook URL |
+| 短信服务 (SMS) | API Key, API Secret |
+
+### 3.5 代理配置 (Proxy)
+
+**位置**: `server/client.js:104-116`
+
+```javascript
+async function sendProxyList(socket) {
+    const list = await R.find("proxy", " user_id = ? ", [socket.userID]);
+    io.to(socket.userID).emit(
+        "proxyList",
+        list.map((bean) => bean.export())  // RedBeanNode 完整导出
+    );
+}
+```
+
+代理配置使用 RedBeanNode 的 `export()` 方法，**导出所有数据库字段**，包括代理的认证信息。
+
+---
+
+## 4. 敏感字段的脱敏/保留边界
+
+### 4.1 监控器 (Monitor) 边界
+
+**保留场景** (`includeSensitiveData = true`):
+
+```javascript
+// server/uptime-kuma-server.js:275
+monitorList.forEach((monitor) => (
+    result[monitor.id] = monitor.toJSON(preloadData)
+));
+
+// server/server.js:998
+callback({
+    ok: true,
+    monitor: monitor.toJSON(preloadData),
+});
+```
+
+**脱敏场景** (`includeSensitiveData = false`):
+
+```javascript
+// server/model/monitor.js:1544
+// 通知消息中的监控器数据（发送到外部通知渠道）
+await Notification.send(
+    JSON.parse(notification.config),
+    msg,
+    monitor.toJSON(preloadData, false),  // includeSensitiveData = false
+    heartbeatJSON
+);
+```
+
+**边界总结**:
+
+| 调用场景 | includeSensitiveData | 敏感字段 | 说明 |
+|----------|---------------------|----------|------|
+| `getMonitorList` | `true` (默认) | ✅ 包含 | 前端展示/编辑监控器 |
+| `getMonitor` | `true` (默认) | ✅ 包含 | 编辑单个监控器 |
+| 通知消息 | `false` | ❌ 排除 | 防止敏感数据泄露到外部通知渠道 |
+| 公开状态页面 | N/A | ❌ 排除 | 使用 `toPublicJSON()` 方法 |
+
+### 4.2 API 密钥 (APIKey) 边界
+
+**保留场景** (`toJSON()`):
+
+```javascript
+// server/socket-handlers/api-key-socket-handler.js:18-52
+// 添加 API 密钥后返回完整密钥（仅显示一次）
+socket.on("addAPIKey", async (key, callback) => {
     // ...
-    let monitor = await R.findOne("monitor", " id = ? AND user_id = ? ", [monitorID, socket.userID]);
     callback({
         ok: true,
-        monitor: monitor.toJSON(preloadData),  // 同样默认包含敏感数据
+        key: bean.toJSON(),  // 包含完整 key 值
     });
 });
 ```
 
-## 5. 备份导入流程
-
-### 5.1 前端触发
-
-**位置**: `src/mixins/socket.js:679-681`
+**脱敏场景** (`toPublicJSON()`):
 
 ```javascript
-uploadBackup(uploadedJSON, importHandle, callback) {
-    socket.emit("uploadBackup", uploadedJSON, importHandle, callback);
+// server/client.js:123-137
+async function sendAPIKeyList(socket) {
+    let result = [];
+    const list = await R.find("api_key", "user_id=?", [socket.userID]);
+
+    for (let bean of list) {
+        result.push(bean.toPublicJSON());  // 移除 key 字段
+    }
+
+    io.to(socket.userID).emit("apiKeyList", result);
 }
 ```
 
-### 5.2 导入处理策略
+**边界总结**:
 
-备份导入功能允许用户上传 JSON 格式的备份数据进行恢复。系统支持两种导入模式：
-1. **合并模式**: 将备份数据与现有数据合并
-2. **替换模式**: 替换数据库中的大部分数据
+| 场景 | 使用方法 | 密钥值 | 说明 |
+|------|----------|--------|------|
+| 创建 API 密钥 | `toJSON()` | ✅ 包含 | 仅创建瞬间可见一次 |
+| API 密钥列表 | `toPublicJSON()` | ❌ 不包含 | 列表中永不显示密钥 |
 
-## 6. 安全考量与建议
+### 4.3 状态页面 (StatusPage) 边界
 
-### 6.1 当前实现的安全特性
+**保留场景** (`toJSON()`):
 
-1. **认证保护**: 所有数据操作都需要通过 `checkLogin(socket)` 验证
-2. **用户隔离**: 每个用户只能访问自己的数据（通过 `user_id` 过滤）
-3. **API 密钥保护**: API 密钥值在列表中不显示，只在创建时显示一次
-4. **公开页面隔离**: 状态页面使用 `toPublicJSON()` 限制公开数据
-5. **密码哈希**: 用户密码使用 bcrypt 哈希存储（`server/password-hash.js`）
-6. **JWT 认证**: 使用 JWT 令牌进行无状态认证
-7. **2FA 支持**: 支持双因素认证增强安全性
+```javascript
+// server/model/status_page.js:361-371
+// 登录用户获取管理后台数据
+static async sendStatusPageList(io, socket) {
+    let result = {};
+    let list = await R.findAll("status_page", " ORDER BY title ");
+    for (let item of list) {
+        result[item.id] = await item.toJSON();  // 完整数据
+    }
+    io.to(socket.userID).emit("statusPageList", result);
+}
+```
 
-### 6.2 潜在风险点
+**脱敏场景** (`toPublicJSON()`):
 
-1. **通知配置完全暴露**: 通知的完整配置（包括 API 密钥）会发送到前端
-2. **监控器敏感数据**: 监控器的密码、密钥等敏感信息在前端可访问
-3. **备份文件安全**: 备份 JSON 文件包含所有敏感配置，需要妥善保管
+```javascript
+// server/model/status_page.js:309-340
+// 公开访问的数据
+static async getStatusPageData(statusPage) {
+    const config = await statusPage.toPublicJSON();  // 公开数据
+    // ...
+}
+```
 
-### 6.3 安全最佳实践
+### 4.4 通知配置 (Notification) 边界
 
-1. **备份文件加密**: 建议对导出的备份文件进行加密存储
-2. **访问控制**: 限制能够访问备份功能的用户权限
-3. **传输安全**: 始终使用 HTTPS 加密所有通信
-4. **密钥轮换**: 定期轮换 API 密钥和访问令牌
-5. **审计日志**: 记录所有备份导入导出操作
+通知配置**没有分级保护机制**，始终使用完整导出：
 
-## 7. 关键代码位置汇总
+```javascript
+// server/client.js:18-36
+async function sendNotificationList(socket) {
+    let result = [];
+    let list = await R.find("notification", " user_id = ? ", [socket.userID]);
 
-| 功能模块 | 文件路径 | 关键方法/函数 |
-|----------|----------|--------------|
-| 监控器模型 | `server/model/monitor.js` | `toJSON()`, `toPublicJSON()` |
-| API 密钥模型 | `server/model/api_key.js` | `toJSON()`, `toPublicJSON()` |
-| 通知模型 | `server/notification.js` | `save()`, `delete()` |
-| 状态页面模型 | `server/model/status_page.js` | `toJSON()`, `toPublicJSON()` |
-| 客户端数据发送 | `server/client.js` | `send*List()` 系列函数 |
-| 监控器列表 | `server/uptime-kuma-server.js` | `getMonitorJSONList()` |
-| 登录后同步 | `server/server.js` | `afterLogin()` |
-| Socket 事件处理 | `server/server.js` | `socket.on()` 事件监听器 |
-| 前端 Socket | `src/mixins/socket.js` | `uploadBackup()` 等 |
-| 密码哈希 | `server/password-hash.js` | `generate()`, `verify()` |
-| 认证检查 | `server/util-server.js` | `checkLogin()`, `doubleCheckPassword()` |
+    for (let bean of list) {
+        let notificationObject = bean.export();  // RedBeanNode 完整导出
+        // ...
+        result.push(notificationObject);
+    }
 
-## 8. 总结
+    io.to(socket.userID).emit("notificationList", result);
+}
+```
 
-Uptime Kuma 采用了多层级的敏感数据保护策略：
+**边界总结**:
 
-1. **模型层面**: 通过 `toJSON()` 和 `toPublicJSON()` 方法分离公开和私有数据
-2. **API 密钥**: 创建后永不完整显示，只在创建瞬间可见
-3. **访问控制**: 通过用户认证和 `user_id` 过滤确保数据隔离
-4. **传输层**: 依赖 HTTPS 进行加密传输
+| 场景 | 使用方法 | 敏感配置 | 说明 |
+|------|----------|----------|------|
+| 通知列表 | `bean.export()` | ✅ 包含 | 前端展示/编辑通知 |
+| 发送通知 | 直接解析 `config` | ✅ 使用 | 运行时需要完整配置 |
 
-对于备份功能，系统设计上允许导出完整配置（包括敏感信息），这是为了确保备份的可恢复性。用户在使用备份功能时应注意：
-- 备份文件包含所有敏感配置，请妥善保管
-- 建议在安全环境中处理备份文件
-- 导入前验证备份来源的可信度
+---
 
-系统通过提供精细粒度的控制（如 `includeSensitiveData` 参数），在功能性和安全性之间取得了平衡。
+## 5. 数据写入时的校验与隔离
+
+虽然没有专门的备份导入功能，但所有数据写入操作（如添加/编辑监控器、保存通知配置）都有统一的校验和隔离机制。
+
+### 5.1 认证校验
+
+**位置**: `server/util-server.js:637-641`
+
+```javascript
+exports.checkLogin = (socket) => {
+    if (!socket.userID) {
+        throw new Error("You are not logged in.");
+    }
+};
+```
+
+所有 Socket 事件 handler 在执行操作前都会调用 `checkLogin()`：
+
+```javascript
+// server/server.js:725-797
+socket.on("add", async (monitor, callback) => {
+    try {
+        checkLogin(socket);  // 第一行检查
+        // ... 后续操作
+    } catch (e) {
+        // ...
+    }
+});
+```
+
+### 5.2 用户隔离机制
+
+#### 5.2.1 Socket 房间隔离
+
+```javascript
+// server/server.js:1804-1806
+async function afterLogin(socket, user) {
+    socket.userID = user.id;
+    socket.join(user.id);  // 加入用户专属房间
+}
+```
+
+#### 5.2.2 数据库查询隔离
+
+```javascript
+// server/server.js:993
+let monitor = await R.findOne(
+    "monitor", 
+    " id = ? AND user_id = ? ",  // 双重条件确保所有权
+    [monitorID, socket.userID]
+);
+
+// server/uptime-kuma-server.js:257-258
+async getMonitorJSONList(userID, monitorID = null) {
+    let query = " user_id = ? ";  // 始终通过 user_id 过滤
+    let queryParams = [userID];
+    // ...
+}
+```
+
+#### 5.2.3 数据写入隔离
+
+```javascript
+// server/server.js:767
+bean.user_id = socket.userID;  // 强制绑定当前用户
+```
+
+### 5.3 数据校验机制
+
+#### 5.3.1 监控器字段校验
+
+```javascript
+// server/server.js:734-760
+// 类型校验
+if (!monitor.accepted_statuscodes.every((code) => typeof code === "string")) {
+    throw new Error("Accepted status codes are not all strings");
+}
+
+// JSON 序列化（隐式格式校验）
+monitor.accepted_statuscodes_json = JSON.stringify(monitor.accepted_statuscodes);
+monitor.kafkaProducerBrokers = JSON.stringify(monitor.kafkaProducerBrokers);
+monitor.kafkaProducerSaslOptions = JSON.stringify(monitor.kafkaProducerSaslOptions);
+monitor.conditions = JSON.stringify(monitor.conditions);
+monitor.rabbitmqNodes = JSON.stringify(monitor.rabbitmqNodes);
+
+// 清理前端专属字段（防止注入）
+const frontendOnlyProperties = [
+    "humanReadableInterval",
+    "globalpingdnsresolvetypeoptions",
+    "responsecheck",
+];
+for (const prop of frontendOnlyProperties) {
+    if (prop in monitor) {
+        delete monitor[prop];
+    }
+}
+
+// RedBeanNode 导入（数据绑定）
+bean.import(monitor);
+
+// 字段名映射
+if (monitor.retryOnlyOnStatusCodeFailure !== undefined) {
+    bean.retry_only_on_status_code_failure = monitor.retryOnlyOnStatusCodeFailure;
+}
+
+// 模型验证
+bean.validate();
+
+await R.store(bean);
+```
+
+#### 5.3.2 通知配置校验
+
+```javascript
+// server/notification.js:241-271
+static async save(notification, notificationID, userID) {
+    if (notificationID) {
+        // 更新现有通知 - 验证所有权
+        let bean = await R.findOne(
+            "notification", 
+            " id = ? AND user_id = ? ",
+            [notificationID, userID]
+        );
+        if (!bean) {
+            throw new Error("notification not found");
+        }
+    } else {
+        bean = R.dispense("notification");
+    }
+
+    // 序列化存储
+    bean.config = JSON.stringify(notification);
+
+    await R.store(bean);
+    return bean;
+}
+```
+
+### 5.4 隔离机制总结
+
+| 层级 | 机制 | 代码位置 | 说明 |
+|------|------|----------|------|
+| 连接层 | `checkLogin(socket)` | `server/util-server.js:637` | 未登录直接抛出异常 |
+| 房间层 | `socket.join(user.id)` | `server/server.js:1806` | 消息仅发送到用户房间 |
+| 查询层 | `user_id = ?` 条件 | `server/uptime-kuma-server.js:257` | 所有查询强制过滤用户 |
+| 写入层 | `bean.user_id = socket.userID` | `server/server.js:767` | 强制绑定当前用户 |
+| 数据层 | `bean.import()` + `bean.validate()` | `server/server.js:762, 769` | 数据结构和字段验证 |
+| 清理层 | 前端专用字段删除 | `server/server.js:751-760` | 防止无效字段污染数据库 |
+
+---
+
+## 6. 安全架构总结
+
+### 6.1 保护层级
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    已认证用户 (Socket 房间)                    │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │              数据同步 (afterLogin)                      │  │
+│  │  ┌─────────────────────────────────────────────────┐  │  │
+│  │  │  监控器 (includeSensitiveData = true)            │  │  │
+│  │  │  ✅ 包含: 密码、密钥、连接字符串、证书            │  │  │
+│  │  └─────────────────────────────────────────────────┘  │  │
+│  │  ┌─────────────────────────────────────────────────┐  │  │
+│  │  │  API 密钥 (toPublicJSON)                         │  │  │
+│  │  │  ❌ 移除: 实际密钥值 (仅创建时显示一次)          │  │  │
+│  │  └─────────────────────────────────────────────────┘  │  │
+│  │  ┌─────────────────────────────────────────────────┐  │  │
+│  │  │  通知配置 (bean.export)                          │  │  │
+│  │  │  ✅ 包含: 完整 config (含 Webhook Token 等)     │  │  │
+│  │  └─────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              └──────────── 隔离边界
+                              │
+┌─────────────────────────────────────────────────────────────┐
+│                    公开访问 (HTTP API)                        │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  状态页面 (toPublicJSON)                               │  │
+│  │  ❌ 移除: 内部管理数据                                  │  │
+│  └───────────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  推送接口 (pushToken 认证)                              │  │
+│  │  ✅ 仅验证 Token, 无敏感数据返回                        │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              └──────────── 外部通知
+                              │
+┌─────────────────────────────────────────────────────────────┐
+│              通知渠道 (Webhook/Email/Telegram 等)              │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  监控器数据 (includeSensitiveData = false)              │  │
+│  │  ❌ 排除: 所有敏感字段                                   │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 关键发现
+
+1. **已认证用户可获取完整敏感配置**: 登录后，监控器的密码、密钥、证书等都会发送到前端
+2. **API 密钥有额外保护**: 密钥值仅在创建瞬间显示一次，列表中永不显示
+3. **通知配置无分级保护**: 完整 `config` 始终发送到前端（包含 Webhook Token 等）
+4. **无专门备份功能**: 当前仓库没有备份导出/导入的实现
+5. **用户隔离是核心保护**: 所有操作通过 `user_id` 严格隔离，配合 `checkLogin()` 认证
+
+### 6.3 代码位置速查
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| 登录后数据同步 | `server/server.js` | 1804-1836 |
+| 监控器 `toJSON()` | `server/model/monitor.js` | 117-254 |
+| API 密钥 `toPublicJSON()` | `server/model/api_key.js` | 42-52 |
+| 通知列表发送 | `server/client.js` | 18-36 |
+| 认证检查 | `server/util-server.js` | 637-641 |
+| 添加监控器校验 | `server/server.js` | 725-797 |
+| 通知保存 | `server/notification.js` | 241-271 |
