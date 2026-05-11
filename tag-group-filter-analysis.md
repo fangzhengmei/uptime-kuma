@@ -128,8 +128,16 @@ async sendMonitorList(socket) {
     return list;
 }
 
-async getMonitorJSONList(userID) {
-    const monitorList = await R.findAll("monitor", " user_id = ? ORDER BY weight, name ", [userID]);
+async getMonitorJSONList(userID, monitorID = null) {
+    let query = " user_id = ? ";
+    let queryParams = [userID];
+
+    if (monitorID) {
+        query += "AND id = ? ";
+        queryParams.push(monitorID);
+    }
+
+    let monitorList = await R.find("monitor", query + "ORDER BY weight DESC, name", queryParams);
     
     // 准备预加载数据（防止 N+1 问题）
     const monitorData = monitorList.map((monitor) => ({
