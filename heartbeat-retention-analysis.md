@@ -168,10 +168,31 @@ DELETE FROM stat_hourly WHERE monitor_id = ? AND timestamp < ?
 
 **图表组件：** `src/components/PingChart.vue`
 
-**时间周期选项：**
-- `0`: 最近（实时心跳列表）
-- `3h`, `6h`, `24h`: 小时级别
-- `168h` (1周): 天级别
+**时间周期选项（`src/components/PingChart.vue:79-84`）：**
+```javascript
+chartPeriodOptions: {
+    0: this.$t("recent"),
+    3: "3h",
+    6: "6h",
+    24: "24h",
+    168: "1w",
+}
+```
+
+**周期到统计层级的映射（`server/socket-handlers/chart-socket-handler.js:19-25`）：**
+
+| 周期选项 | 小时数 | 判断条件 | 实际统计层级 | 数据来源 |
+|---------|-------|---------|-------------|---------|
+| recent | 0 | 特殊处理 | 原始心跳 | `heartbeatList` |
+| 3h | 3 | `period <= 24` | 分钟级 | `stat_minutely` |
+| 6h | 6 | `period <= 24` | 分钟级 | `stat_minutely` |
+| 24h | 24 | `period <= 24` | 分钟级 | `stat_minutely` |
+| 1w | 168 | `period <= 720` (30天) | **小时级** | `stat_hourly` |
+| >720h (>30天) | >720 | `period > 720` | 天级 | `stat_daily` |
+
+**关键发现：1w (168h) 周期实际使用小时级数据，而非天级。**
+
+原因：`168 <= 720` 为 true，所以命中 `period <= 720` 分支，使用小时级统计数据。
 
 #### 数据获取逻辑（`chartData` 计算属性，行 217-223）：
 
