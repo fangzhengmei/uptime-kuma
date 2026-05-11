@@ -99,7 +99,7 @@ Database.dataDir = process.env.DATA_DIR || args["data-dir"] || "./data/";
 | `UPTIME_KUMA_ENABLE_EMBEDDED_MARIADB` | 嵌入式 MariaDB | `false` | `setup-database.js:127` |
 | `UPTIME_KUMA_DB_POOL_MAX_CONNECTIONS` | 连接池大小 | `10` | `database.js:225` |
 | `UPTIME_KUMA_SQLITE_SINGLE_CONNECTION` | SQLite 单连接 | `true` | `database.js:275` |
-| `UPTIME_KUMA_IS_CONTAINER` | 容器标识 | `false` | 多处 |
+| `UPTIME_KUMA_IS_CONTAINER` | 容器标识 | 未设置 (`undefined`) | 多处（判断方式不一致） |
 | `UPTIME_KUMA_WS_ORIGIN_CHECK` | WS 源检查 | `cors-like` | `server.js:62` |
 | `UPTIME_KUMA_DISABLE_FRAME_SAMEORIGIN` | 禁用 X-Frame | `false` | `server.js:147` |
 | `UPTIME_KUMA_CLOUDFLARED_TOKEN` | Cloudflared | 空 | `server.js:148` |
