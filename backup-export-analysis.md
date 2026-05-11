@@ -11,7 +11,7 @@
 | 功能 | 状态 | 代码证据 |
 |------|------|----------|
 | 备份导出 | ❌ 不存在 | 无 `downloadBackup`、`exportBackup`、`getBackup` 相关代码 |
-| 备份导入 | ⚠️ 前端存根 | 前端有 `uploadBackup` 方法，后端无对应 handler |
+| 备份导入 | ⚠️ 前端存根，无调用链 | 前端有 `uploadBackup` 方法定义，但：<br>1) 后端无对应 handler<br>2) 前端无任何页面/组件调用该方法 |
 
 ### 1.2 导出功能调用链（不存在）
 
@@ -28,14 +28,16 @@ socket.on("addNotification", ...)
 socket.on("deleteNotification", ...)
 socket.on("addAPIKey", ...)
 socket.on("getAPIKeyList", ...)
-// ... 共 47 个 handler，无 downloadBackup/exportBackup/getBackup
+// ... 共 86 个 handler，无 downloadBackup/exportBackup/getBackup
 ```
 
 **结论**：导出功能从未实现，无调用链。
 
-### 1.3 导入功能调用链（终点为未实现）
+### 1.3 导入功能调用链（完整缺失）
 
-**前端入口** - `src/mixins/socket.js:679-681`：
+#### 1.3.1 前端方法定义（仅存在，未被调用）
+
+**前端存根方法** - `src/mixins/socket.js:672-681`：
 ```javascript
 /**
  * Upload the provided backup
@@ -50,7 +52,25 @@ uploadBackup(uploadedJSON, importHandle, callback) {
 }
 ```
 
-**调用链终点** - 后端无对应 handler：
+#### 1.3.2 前端调用点搜索（无调用）
+
+搜索所有前端文件：
+```
+- src/mixins/socket.js: 定义 uploadBackup 方法
+- src/pages/*.vue: 无任何页面使用 uploadBackup
+- src/components/*.vue: 无任何组件使用 uploadBackup
+
+搜索结果：仅在 socket.js 中找到定义，无调用点。
+```
+
+**代码证据** - `src/mixins/socket.js` 方法定义但无引用：
+```
+定义位置: src/mixins/socket.js:679
+搜索调用点: grep -rn "uploadBackup(" src/ --include="*.vue" --include="*.js"
+结果: 仅在定义处出现一次，无调用
+```
+
+#### 1.3.3 后端无对应 handler
 
 搜索 `server/server.js` 和 `server/socket-handlers/` 所有文件：
 ```
@@ -70,25 +90,147 @@ uploadBackup(uploadedJSON, importHandle, callback) {
 未找到：socket.on("uploadBackup", ...)
 ```
 
-**调用链总结**：
+#### 1.3.4 实际失败路径和用户可见结果
+
+**完整调用链分析**：
+
 ```
-前端: uploadBackup(uploadedJSON, importHandle, callback)
+用户视角（当前无法触发）:
+┌─────────────────────────────────────────────────────────────┐
+│  UI 页面: 无备份导入按钮/界面                                  │
+│  原因: Settings.vue 等页面无 backup 相关代码                   │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼ (用户无法到达此步骤)
+┌─────────────────────────────────────────────────────────────┐
+│  前端方法: this.uploadBackup(uploadedJSON, importHandle, cb)  │
+│  位置: src/mixins/socket.js:679-681                          │
+│  状态: 方法定义存在，但无调用                                  │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼ (假设通过控制台手动调用)
+┌─────────────────────────────────────────────────────────────┐
+│  Socket.emit: socket.emit("uploadBackup", ...)               │
+│  行为: 向服务端发送事件                                        │
+└─────────────────────────────────────────────────────────────┘
          │
          ▼
-    socket.emit("uploadBackup", ...)
+┌─────────────────────────────────────────────────────────────┐
+│  服务端处理: 无 handler                                       │
+│  Socket.io 行为:                                             │
+│    - 未注册的事件被静默忽略                                   │
+│    - 不会抛出异常                                             │
+│    - callback 永远不会被调用                                  │
+└─────────────────────────────────────────────────────────────┘
          │
          ▼
-    ┌─────────────────┐
-    │  后端: 无 handler │  ← 终点
-    │  调用被静默忽略  │
-    └─────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  用户可见结果（假设调用）:                                     │
+│    1. 无任何错误提示                                          │
+│    2. 无任何成功提示                                          │
+│    3. 页面无任何变化                                          │
+│    4. 数据库无任何变化                                        │
+│    5. 前端 callback 永远等待（超时或挂起）                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Socket.io 对未注册事件的行为说明**：
+
+Socket.io 设计上，当客户端发送一个服务端未注册的事件时：
+1. 服务端不会抛出异常
+2. 服务端不会记录日志（除非自定义了未处理事件的监听）
+3. 客户端的 callback 永远不会被执行
+4. 客户端会一直等待 callback，直到超时或连接断开
+
+**代码证据 - 服务端无错误处理** - 搜索所有 socket 相关代码：
+```javascript
+// 所有 handler 都有 try-catch，但未注册的事件不会进入任何 handler
+socket.on("add", async (monitor, callback) => {
+    try {
+        // ... 处理逻辑
+        callback({ ok: true, ... });
+    } catch (e) {
+        callback({ ok: false, msg: e.message });  // 只有已注册事件才会走到这里
+    }
+});
+
+// 未注册的 "uploadBackup" 事件:
+// - 不会进入任何 try-catch
+// - 不会调用 callback
+// - 静默失败
+```
+
+#### 1.3.5 调用链总结
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    实际状态（当前仓库）                        │
+│                                                             │
+│  1. UI 层: ❌ 无备份导入按钮/页面                             │
+│     证据: Settings.vue 等页面无 backup 相关代码               │
+│                                                             │
+│  2. 方法定义: ⚠️ 仅定义不调用                                 │
+│     证据: uploadBackup 仅在 socket.js 中定义，无调用点        │
+│                                                             │
+│  3. 后端 handler: ❌ 不存在                                   │
+│     证据: 86 个 Socket handler 中无 uploadBackup             │
+│                                                             │
+│  4. 假设调用行为: ⚠️ 静默失败                                 │
+│     证据: Socket.io 未注册事件被静默忽略，callback 永不调用    │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 第二段：敏感字段在已登录侧与外部通知侧的保留和脱敏边界
 
-### 2.1 监控器 (Monitor) 边界
+### 2.1 数据流向总览
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    数据存储层 (数据库)                         │
+│                                                             │
+│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐    │
+│  │   monitor     │  │  notification │  │   api_key     │    │
+│  │ (所有字段)     │  │  (config JSON)│  │  (key 字段)   │    │
+│  └───────┬───────┘  └───────┬───────┘  └───────┬───────┘    │
+│          │                  │                  │            │
+└──────────┼──────────────────┼──────────────────┼────────────┘
+           │                  │                  │
+           ▼                  ▼                  ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    已登录侧 (Socket 房间)                      │
+│                                                             │
+│  监控器: toJSON(preloadData) → includeSensitiveData=true     │
+│    ✅ 包含: HTTP 认证、OAuth、数据库连接串、TLS 证书等        │
+│                                                             │
+│  通知配置: bean.export() → 完整导出                          │
+│    ✅ 包含: Webhook URL、Bot Token、SMTP 密码等              │
+│                                                             │
+│  API 密钥: toPublicJSON() → 移除 key 字段                    │
+│    ❌ 不包含: 实际密钥值 (仅创建时显示一次)                   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+           │                  │
+           │                  │ (通知凭据用于发送)
+           │                  │
+           ▼                  ▼
+┌─────────────────────────────────────────────────────────────┐
+│                 外部通知侧 (出站发送)                          │
+│                                                             │
+│  监控器数据 (附带在通知消息中):                                │
+│    ❌ 排除: monitor.toJSON(preloadData, false)              │
+│    敏感字段全排除                                            │
+│                                                             │
+│  通知凭据 (用于连接外部服务):                                  │
+│    ✅ 保留: 直接从 notification 对象读取                      │
+│    无脱敏、无裁剪、直接使用                                   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 监控器 (Monitor) 边界
 
 **核心控制参数** - `server/model/monitor.js:117-254`：
 ```javascript
@@ -140,9 +282,7 @@ toJSON(preloadData = {}, includeSensitiveData = true) {
 }
 ```
 
-### 2.2 已登录侧（前端同步）- 保留所有敏感字段
-
-**场景 1：获取监控器列表** - `server/uptime-kuma-server.js:256-277`：
+**已登录侧（前端同步）- 保留所有敏感字段** - `server/uptime-kuma-server.js:256-277`：
 ```javascript
 async getMonitorJSONList(userID, monitorID = null) {
     let query = " user_id = ? ";
@@ -169,55 +309,7 @@ async getMonitorJSONList(userID, monitorID = null) {
 }
 ```
 
-**场景 2：获取单个监控器** - `server/server.js:987-1006`：
-```javascript
-socket.on("getMonitor", async (monitorID, callback) => {
-    try {
-        checkLogin(socket);
-
-        log.info("monitor", `Get Monitor: ${monitorID} User ID: ${socket.userID}`);
-
-        let monitor = await R.findOne("monitor", " id = ? AND user_id = ? ", [monitorID, socket.userID]);
-        const monitorData = [{ id: monitor.id, active: monitor.active }];
-        const preloadData = await Monitor.preparePreloadData(monitorData);
-        callback({
-            ok: true,
-            monitor: monitor.toJSON(preloadData),  // includeSensitiveData = true
-        });
-    } catch (e) {
-        callback({
-            ok: false,
-            msg: e.message,
-        });
-    }
-});
-```
-
-**场景 3：登录后完整同步** - `server/server.js:1804-1836`：
-```javascript
-async function afterLogin(socket, user) {
-    socket.userID = user.id;
-    socket.join(user.id);
-
-    let monitorList = await server.sendMonitorList(socket);  // 包含所有敏感字段
-    await Promise.allSettled([
-        sendInfo(socket),
-        server.sendMaintenanceList(socket),
-        sendNotificationList(socket),      // 完整通知配置
-        sendProxyList(socket),
-        sendDockerHostList(socket),
-        sendAPIKeyList(socket),            // 不包含实际密钥值
-        sendRemoteBrowserList(socket),
-        sendMonitorTypeList(socket),
-    ]);
-
-    await StatusPage.sendStatusPageList(io, socket);
-}
-```
-
-### 2.3 外部通知侧 - 脱敏所有敏感字段
-
-**场景：发送通知消息** - `server/model/monitor.js:1541-1547`：
+**外部通知侧（出站发送）- 脱敏所有敏感字段** - `server/model/monitor.js:1541-1547`：
 ```javascript
 await Notification.send(
     JSON.parse(notification.config),
@@ -227,7 +319,7 @@ await Notification.send(
 );
 ```
 
-### 2.4 API 密钥 (APIKey) 边界
+### 2.3 API 密钥 (APIKey) 边界
 
 **模型定义** - `server/model/api_key.js:24-52`：
 ```javascript
@@ -299,7 +391,9 @@ socket.on("addAPIKey", async (key, callback) => {
 });
 ```
 
-### 2.5 通知配置 (Notification) 边界
+### 2.4 通知配置 (Notification) 边界 - 关键补充
+
+#### 2.4.1 通知凭据的存储和已登录侧边界
 
 **存储机制** - `server/notification.js:260-264`：
 ```javascript
@@ -309,7 +403,7 @@ bean.config = JSON.stringify(notification);  // 完整配置 JSON 化存储
 bean.is_default = notification.isDefault || false;
 ```
 
-**已登录侧** - `server/client.js:18-36`：
+**已登录侧（前端同步）** - `server/client.js:18-36`：
 ```javascript
 async function sendNotificationList(socket) {
     const timeLogger = new TimeLogger();
@@ -332,48 +426,216 @@ async function sendNotificationList(socket) {
 }
 ```
 
-### 2.6 边界总结表
+#### 2.4.2 通知凭据在出站发送时的保留边界 - 关键发现
 
-| 数据类型 | 已登录侧 | 外部通知侧 | 控制机制 |
+**Notification.send 分发** - `server/notification.js:228-234`：
+```javascript
+static async send(notification, msg, monitorJSON = null, heartbeatJSON = null) {
+    if (this.providerList[notification.type]) {
+        // 直接将完整 notification 对象传给具体提供商
+        // notification 包含完整 config：Webhook URL、Bot Token、SMTP 密码等
+        return this.providerList[notification.type].send(notification, msg, monitorJSON, heartbeatJSON);
+    } else {
+        throw new Error("Notification type is not supported");
+    }
+}
+```
+
+**关键证据**：`notification` 对象**完整传递**给具体通知提供商，无任何脱敏或裁剪。
+
+#### 2.4.3 Webhook 提供商 - 凭据直接使用
+
+**Webhook 实现** - `server/notification-providers/webhook.js:11-70`：
+```javascript
+async send(notification, msg, monitorJSON = null, heartbeatJSON = null) {
+    const okMsg = "Sent Successfully.";
+
+    try {
+        const httpMethod = notification.httpMethod?.toLowerCase() || "post";
+
+        let data = {
+            heartbeat: heartbeatJSON,
+            monitor: monitorJSON,  // 这是已脱敏的 monitorJSON
+            msg,
+        };
+        let config = {
+            headers: {},
+        };
+
+        // ... 处理 content type
+
+        // 直接读取 notification.webhookAdditionalHeaders（可能包含认证 Token）
+        if (notification.webhookAdditionalHeaders) {
+            try {
+                config.headers = {
+                    ...config.headers,
+                    ...JSON.parse(notification.webhookAdditionalHeaders),  // 直接使用，无脱敏
+                };
+            } catch (err) {
+                throw new Error("Additional Headers is not a valid JSON");
+            }
+        }
+
+        config = this.getAxiosConfigWithProxy(config);
+
+        // 直接使用 notification.webhookURL，无脱敏
+        if (httpMethod === "get") {
+            await axios.get(notification.webhookURL, config);  // webhookURL 直接使用
+        } else {
+            await axios.post(notification.webhookURL, data, config);  // webhookURL 直接使用
+        }
+
+        return okMsg;
+    } catch (error) {
+        this.throwGeneralAxiosError(error);
+    }
+}
+```
+
+**Webhook 凭据边界**：
+| 凭据字段 | 已登录侧 | 出站发送时 | 脱敏状态 |
 |----------|----------|------------|----------|
-| **监控器** | | | |
-| HTTP 认证 | ✅ 包含 | ❌ 排除 | `includeSensitiveData` |
-| OAuth 2.0 | ✅ 包含 | ❌ 排除 | `includeSensitiveData` |
-| 数据库连接串 | ✅ 包含 | ❌ 排除 | `includeSensitiveData` |
-| TLS 证书/私钥 | ✅ 包含 | ❌ 排除 | `includeSensitiveData` |
-| RADIUS 认证 | ✅ 包含 | ❌ 排除 | `includeSensitiveData` |
-| MQTT 认证 | ✅ 包含 | ❌ 排除 | `includeSensitiveData` |
-| Push Token | ✅ 包含 | ❌ 排除 | `includeSensitiveData` |
-| **API 密钥** | | | |
-| 密钥值 (key) | ⚠️ 仅创建时显示一次 | N/A | `toJSON()` vs `toPublicJSON()` |
-| **通知配置** | | | |
-| Webhook URL | ✅ 包含 | N/A（发送方不需要） | `bean.export()` |
-| Bot Token | ✅ 包含 | N/A | `bean.export()` |
-| SMTP 密码 | ✅ 包含 | N/A | `bean.export()` |
+| `webhookURL` | ✅ 包含 | ✅ 直接使用 | 无脱敏 |
+| `webhookAdditionalHeaders` | ✅ 包含 | ✅ 直接解析使用 | 无脱敏（可能包含 Authorization Token） |
+| `webhookCustomBody` | ✅ 包含 | ✅ 直接渲染 | 无脱敏 |
 
-### 2.7 边界代码路径
+#### 2.4.4 Telegram 提供商 - Bot Token 直接使用
+
+**Telegram 实现** - `server/notification-providers/telegram.js:51-80`：
+```javascript
+async send(notification, msg, monitorJSON = null, heartbeatJSON = null) {
+    const okMsg = "Sent Successfully.";
+    // 直接读取 notification.telegramServerUrl，无脱敏
+    const url = notification.telegramServerUrl ?? "https://api.telegram.org";
+
+    try {
+        let params = {
+            // 直接读取 notification.telegramChatID，无脱敏
+            chat_id: notification.telegramChatID,
+            text: msg,
+            disable_notification: notification.telegramSendSilently ?? false,
+            protect_content: notification.telegramProtectContent ?? false,
+            link_preview_options: { is_disabled: true },
+        };
+        // ...
+
+        // Bot Token 构建在 URL 中：https://api.telegram.org/bot{token}/sendMessage
+        // token 从 notification 对象读取，无脱敏
+    }
+}
+```
+
+**Telegram 凭据边界**：
+| 凭据字段 | 已登录侧 | 出站发送时 | 脱敏状态 |
+|----------|----------|------------|----------|
+| `telegramServerUrl` | ✅ 包含 | ✅ 直接使用 | 无脱敏 |
+| `telegramBotToken` | ✅ 包含 | ✅ 直接使用 | 无脱敏（嵌入 API URL） |
+| `telegramChatID` | ✅ 包含 | ✅ 直接使用 | 无脱敏 |
+
+#### 2.4.5 SMTP 提供商 - 密码直接使用
+
+**SMTP 实现** - `server/notification-providers/smtp.js:11-91`：
+```javascript
+async send(notification, msg, monitorJSON = null, heartbeatJSON = null) {
+    const okMsg = "Sent Successfully.";
+
+    // 直接读取 SMTP 配置，无脱敏
+    const config = {
+        host: notification.smtpHost,      // 直接使用
+        port: notification.smtpPort,      // 直接使用
+        secure: notification.smtpSecure,  // 直接使用
+    };
+
+    // ... TLS 配置
+
+    // DKIM 私钥直接使用
+    if (notification.smtpDkimDomain) {
+        config.dkim = {
+            domainName: notification.smtpDkimDomain,
+            keySelector: notification.smtpDkimKeySelector,
+            privateKey: notification.smtpDkimPrivateKey,  // 私钥直接使用，无脱敏
+            hashAlgo: notification.smtpDkimHashAlgo,
+            headerFieldNames: notification.smtpDkimheaderFieldNames,
+            skipFields: notification.smtpDkimskipFields,
+        };
+    }
+
+    // SMTP 认证直接使用
+    if (notification.smtpUsername || notification.smtpPassword) {
+        config.auth = {
+            user: notification.smtpUsername,  // 用户名直接使用
+            pass: notification.smtpPassword,  // 密码直接使用，无脱敏
+        };
+    }
+
+    // ... 发送邮件
+    let transporter = nodemailer.createTransport(config);
+    await transporter.sendMail({
+        from: notification.smtpFrom,
+        cc: notification.smtpCC,
+        bcc: notification.smtpBCC,
+        to: notification.smtpTo,
+        // ...
+    });
+
+    return okMsg;
+}
+```
+
+**SMTP 凭据边界**：
+| 凭据字段 | 已登录侧 | 出站发送时 | 脱敏状态 |
+|----------|----------|------------|----------|
+| `smtpHost` | ✅ 包含 | ✅ 直接使用 | 无脱敏 |
+| `smtpPort` | ✅ 包含 | ✅ 直接使用 | 无脱敏 |
+| `smtpUsername` | ✅ 包含 | ✅ 直接使用 | 无脱敏 |
+| `smtpPassword` | ✅ 包含 | ✅ 直接使用 | **无脱敏（明文传递给 nodemailer）** |
+| `smtpDkimPrivateKey` | ✅ 包含 | ✅ 直接使用 | **无脱敏（私钥明文）** |
+
+#### 2.4.6 通知凭据边界总结
+
+**通知系统的设计逻辑**：
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    已登录侧 (Socket 房间)                      │
+│  通知凭据的特殊地位                                           │
 │                                                             │
-│  登录后同步: afterLogin()                                    │
-│  ├── 监控器: toJSON(preloadData) → includeSensitiveData=true │
-│  ├── API 密钥: toPublicJSON() → 移除 key 字段                │
-│  └── 通知配置: bean.export() → 完整导出                       │
+│  通知凭据（Webhook URL、Bot Token、SMTP 密码等）不是"附带   │
+│  数据"，而是"连接凭据"。它们用于连接外部通知服务，因此：      │
 │                                                             │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  外部通知侧 (Webhook/Email 等)                 │
+│  1. 存储时: 完整保存到 config JSON 字段                       │
+│  2. 已登录侧: 完整发送到前端（用户需要编辑配置）              │
+│  3. 出站发送时: 完整使用（必须使用真实凭据才能连接外部服务）  │
+│  4. 无脱敏: 任何时候都不脱敏，因为脱敏后无法使用              │
 │                                                             │
-│  发送通知: Notification.send()                               │
-│  └── 监控器: toJSON(preloadData, false) → 敏感字段全排除      │
-│                                                             │
+│  ⚠️ 这是合理的设计，但意味着:                                 │
+│    - 通知凭据始终以明文形式存在于数据库                       │
+│    - 通知凭据始终以明文形式发送到已登录用户的前端             │
+│    - 通知凭据在出站发送时直接使用（这是必需的）               │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+**完整边界表**：
+
+| 数据类型 | 字段 | 已登录侧 | 外部通知侧（附带数据） | 外部通知侧（连接凭据） | 控制机制 |
+|----------|------|----------|------------------------|------------------------|----------|
+| **监控器** | | | | | |
+| HTTP 认证 | `basic_auth_user`, `basic_auth_pass` | ✅ 包含 | ❌ 排除 | N/A | `includeSensitiveData` |
+| OAuth 2.0 | `oauth_client_id`, `oauth_client_secret` 等 | ✅ 包含 | ❌ 排除 | N/A | `includeSensitiveData` |
+| 数据库连接串 | `databaseConnectionString` | ✅ 包含 | ❌ 排除 | N/A | `includeSensitiveData` |
+| TLS 证书/私钥 | `tlsCa`, `tlsCert`, `tlsKey` | ✅ 包含 | ❌ 排除 | N/A | `includeSensitiveData` |
+| Push Token | `pushToken` | ✅ 包含 | ❌ 排除 | N/A | `includeSensitiveData` |
+| **API 密钥** | | | | | |
+| 密钥值 (key) | `key` | ⚠️ 仅创建时显示一次 | N/A | N/A | `toJSON()` vs `toPublicJSON()` |
+| **通知配置** | | | | | |
+| Webhook URL | `webhookURL` | ✅ 包含 | N/A | ✅ 直接使用 | 无脱敏 |
+| Webhook Headers | `webhookAdditionalHeaders` | ✅ 包含 | N/A | ✅ 直接使用 | 无脱敏（可能含 Token） |
+| Telegram Bot Token | `telegramBotToken` | ✅ 包含 | N/A | ✅ 直接使用 | 无脱敏 |
+| SMTP 密码 | `smtpPassword` | ✅ 包含 | N/A | ✅ 直接使用 | 无脱敏（明文） |
+| DKIM 私钥 | `smtpDkimPrivateKey` | ✅ 包含 | N/A | ✅ 直接使用 | 无脱敏（明文） |
+
+**关键区分**：
+- **附带数据**（如监控器配置）: 发送到外部通知渠道时会脱敏
+- **连接凭据**（如 Webhook URL、Bot Token、SMTP 密码）: 始终保留，因为它们是连接外部服务所必需的
 
 ---
 
@@ -577,13 +839,41 @@ await R.store(bean);  // 持久化
 如果未来实现备份导入功能，应遵循以下校验隔离流程：
 
 ```
-1. 认证校验: checkLogin(socket)
-2. 数据解析: JSON.parse(backupData)，验证格式
-3. 权限校验: 验证数据中的 user_id 与当前用户匹配
-4. 数据清理: 删除前端专属字段
-5. 字段映射: camelCase → snake_case
-6. 数据绑定: bean.import(data)
-7. 强制隔离: bean.user_id = socket.userID（覆盖导入数据）
-8. 模型验证: bean.validate()
-9. 持久化: R.store(bean)
+┌─────────────────────────────────────────────────────────────┐
+│  备份导入校验隔离流程（建议）                                 │
+│                                                             │
+│  1. 认证校验: checkLogin(socket)                             │
+│     └── 未登录直接拒绝                                       │
+│                                                             │
+│  2. 数据解析: JSON.parse(backupData)                         │
+│     └── 验证 JSON 格式，解析失败抛出异常                      │
+│                                                             │
+│  3. 数据结构校验:                                            │
+│     └── 验证必需字段、数据类型、格式约束                      │
+│                                                             │
+│  4. 权限校验:                                                │
+│     └── 验证备份数据中的 user_id 与当前用户匹配               │
+│     └── 或直接忽略 user_id，使用当前 socket.userID 覆盖      │
+│                                                             │
+│  5. 数据清理:                                                │
+│     └── 删除前端专属字段（frontendOnlyProperties）           │
+│     └── 删除不应导入的字段（如 id、created_date 等）          │
+│                                                             │
+│  6. 字段映射:                                                │
+│     └── camelCase → snake_case                              │
+│                                                             │
+│  7. 数据绑定:                                                │
+│     └── bean.import(data)                                   │
+│     └── bean.user_id = socket.userID（强制覆盖）             │
+│                                                             │
+│  8. 模型验证:                                                │
+│     └── bean.validate()                                     │
+│                                                             │
+│  9. 事务处理:                                                │
+│     └── 所有导入操作在一个事务中，失败回滚                    │
+│                                                             │
+│  10. 持久化:                                                 │
+│      └── R.store(bean)                                      │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
 ```
