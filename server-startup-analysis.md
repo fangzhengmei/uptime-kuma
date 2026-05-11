@@ -99,7 +99,7 @@ Database.dataDir = process.env.DATA_DIR || args["data-dir"] || "./data/";
 | `UPTIME_KUMA_ENABLE_EMBEDDED_MARIADB` | 嵌入式 MariaDB | `false` | `setup-database.js:127` |
 | `UPTIME_KUMA_DB_POOL_MAX_CONNECTIONS` | 连接池大小 | `10` | `database.js:225` |
 | `UPTIME_KUMA_SQLITE_SINGLE_CONNECTION` | SQLite 单连接 | `true` | `database.js:275` |
-| `UPTIME_KUMA_IS_CONTAINER` | 容器标识 | 未设置 (`undefined`) | 多处（判断方式不一致） |
+| `UPTIME_KUMA_IS_CONTAINER` | 容器标识（判断方式不一致） | 未设置 (`undefined`) | 详见 6.3 节 |
 | `UPTIME_KUMA_WS_ORIGIN_CHECK` | WS 源检查 | `cors-like` | `server.js:62` |
 | `UPTIME_KUMA_DISABLE_FRAME_SAMEORIGIN` | 禁用 X-Frame | `false` | `server.js:147` |
 | `UPTIME_KUMA_CLOUDFLARED_TOKEN` | Cloudflared | 空 | `server.js:148` |
@@ -413,13 +413,31 @@ exports.allowDevAllOrigin = (res) => {
 
 ### 6.3 容器环境分叉点
 
-`UPTIME_KUMA_IS_CONTAINER` 环境变量（Dockerfile 中预设为 `1`）。
+#### 6.3.1 代码中所有判断位置汇总
 
-**分叉点 1: NSCD 服务** (`uptime-kuma-server.js:507-531`)
+基于代码真实逻辑，`UPTIME_KUMA_IS_CONTAINER` 在以下 4 个位置被使用：
+
+| 文件位置 | 判断方式 | 功能 |
+|---------|---------|------|
+| `uptime-kuma-server.js:508` | `if (process.env.UPTIME_KUMA_IS_CONTAINER)` | 启动 NSCD 服务 |
+| `uptime-kuma-server.js:523` | `if (process.env.UPTIME_KUMA_IS_CONTAINER)` | 停止 NSCD 服务 |
+| `real-browser-monitor-type.js:119` | `if (process.env.UPTIME_KUMA_IS_CONTAINER)` | 浏览器可执行路径 |
+| `server.js:66` | `process.env.UPTIME_KUMA_IS_CONTAINER === "1"` | 日志调试输出 |
+| `client.js:154` | `process.env.UPTIME_KUMA_IS_CONTAINER === "1"` | 前端 isContainer 标识 |
+
+---
+
+#### 6.3.2 两类判断方式分类
+
+**A 类：非空即触发**（真值判断 `if (env)`）
+
+任何非空字符串（包括 `"0"`、`"false"`、`"true"`）都会触发这些分支。
+
+**分支 A1：NSCD 服务启动/停止** (`uptime-kuma-server.js:507-531`)
 
 ```javascript
 async startNSCDServices() {
-    if (process.env.UPTIME_KUMA_IS_CONTAINER) {
+    if (process.env.UPTIME_KUMA_IS_CONTAINER) {  // 真值判断
         try {
             log.info("services", "Starting nscd");
             await childProcessAsync.exec("sudo service nscd start");
@@ -430,50 +448,115 @@ async startNSCDServices() {
 }
 ```
 
-- **容器**: 启动 nscd（DNS 缓存服务）
-- **非容器**: 跳过
-
-**分叉点 2: 浏览器可执行路径** (`real-browser-monitor-type.js:118-124`)
+**分支 A2：浏览器可执行路径** (`real-browser-monitor-type.js:118-124`)
 
 ```javascript
 } else if (!executablePath) {
-    if (process.env.UPTIME_KUMA_IS_CONTAINER) {
-        // 容器内固定路径
+    if (process.env.UPTIME_KUMA_IS_CONTAINER) {  // 真值判断
         executablePath = "/usr/bin/chromium";
         await installChromiumViaApt(executablePath);
     } else {
-        // 本地系统搜索
         executablePath = await findChrome(allowedList);
     }
 }
 ```
 
-- **容器**: 使用 `/usr/bin/chromium`，自动 apt 安装
-- **非容器**: 搜索系统 Chrome/Chromium 安装路径
+---
 
-**分叉点 3: 嵌入式 MariaDB 支持** (`embedded-mariadb.js:57-64`)
+**B 类：仅等于 1 才触发**（严格相等 `env === "1"`）
+
+只有精确等于字符串 `"1"` 才会触发这些分支。
+
+**分支 B1：日志容器标识** (`server.js:66`)
 
 ```javascript
-start() {
-    // 检查运行用户
-    this.username = require("os").userInfo().username;
-    if (this.username !== "node" && this.username !== "root") {
-        throw new Error("Embedded Mariadb supports only 'node' or 'root' user");
-    }
-    // ...
-}
+log.debug("server", "Inside Container: " + (process.env.UPTIME_KUMA_IS_CONTAINER === "1"));
 ```
 
-- **容器**: 用户是 `node`，可以使用
-- **非容器**: 通常不是 `node`/`root`，无法使用
-
-**分叉点 4: 前端信息标识** (`client.js:154`)
+**分支 B2：前端信息标识** (`client.js:154`)
 
 ```javascript
 info.isContainer = process.env.UPTIME_KUMA_IS_CONTAINER === "1";
 ```
 
-- 向前端传递是否在容器中运行的信息
+---
+
+#### 6.3.3 不同值的行为对照总表
+
+| `UPTIME_KUMA_IS_CONTAINER` 值 | A 类 (NSCD/浏览器) | B 类 (日志/前端) | 综合效果 |
+|-----------------------------|-------------------|-----------------|---------|
+| **未设置** (`undefined`) | ❌ 不触发 | ❌ 不触发 | **本地运行** ✅ |
+| **空字符串** (`""`) | ❌ 不触发 | ❌ 不触发 | 本地运行 |
+| **`"1"`** | ✅ 触发 | ✅ 触发 | **完整容器模式** ✅ |
+| **`"0"`** | ✅ **触发** ⚠️ | ❌ 不触发 | **不一致**：行为是容器，显示非容器 |
+| **`"false"`** | ✅ **触发** ⚠️ | ❌ 不触发 | **不一致**：行为是容器，显示非容器 |
+| **`"true"`** | ✅ **触发** ⚠️ | ❌ 不触发 | **不一致**：行为是容器，显示非容器 |
+| **其他非空值** | ✅ **触发** ⚠️ | ❌ 不触发 | **不一致**：行为是容器，显示非容器 |
+
+**A 类详细行为**：
+
+| 值 | NSCD 服务 | 浏览器路径 |
+|---|---------|-----------|
+| `undefined` | 不启动，跳过 | 系统搜索 Chrome/Chromium |
+| `""` | 不启动，跳过 | 系统搜索 Chrome/Chromium |
+| `"1"` | 启动 nscd | 使用 `/usr/bin/chromium`，apt 安装 |
+| `"0"` | **启动 nscd** | **使用容器路径** |
+| `"false"` | **启动 nscd** | **使用容器路径** |
+
+**B 类详细行为**：
+
+| 值 | 日志 `Inside Container` | 前端 `info.isContainer` |
+|---|------------------------|------------------------|
+| `undefined` | `false` | `false` |
+| `""` | `false` | `false` |
+| `"1"` | `true` | `true` |
+| `"0"` | `false` | `false` |
+| `"false"` | `false` | `false` |
+
+---
+
+#### 6.3.4 正确使用方式
+
+| 场景 | 环境变量设置 | 说明 |
+|-----|-------------|------|
+| **本地运行** | 不设置 `UPTIME_KUMA_IS_CONTAINER` | 保持 `undefined`，A 类和 B 类都不触发 |
+| **容器模式** | `UPTIME_KUMA_IS_CONTAINER=1` | A 类和 B 类都触发，行为一致 |
+| **⚠️ 错误用法** | `UPTIME_KUMA_IS_CONTAINER=0` | A 类触发，B 类不触发，行为不一致 |
+| **⚠️ 错误用法** | `UPTIME_KUMA_IS_CONTAINER=false` | A 类触发，B 类不触发，行为不一致 |
+
+**Dockerfile 中的正确设置** (`docker/dockerfile:34`)：
+
+```dockerfile
+ENV UPTIME_KUMA_IS_CONTAINER=1
+```
+
+---
+
+#### 6.3.5 嵌入式 MariaDB 的特别说明
+
+嵌入式 MariaDB 的启用条件**与 `UPTIME_KUMA_IS_CONTAINER` 无关**。
+
+**启用条件**: `UPTIME_KUMA_ENABLE_EMBEDDED_MARIADB === "1"` (`setup-database.js:127`)
+
+```javascript
+isEnabledEmbeddedMariaDB() {
+    return process.env.UPTIME_KUMA_ENABLE_EMBEDDED_MARIADB === "1";
+}
+```
+
+**用户限制**: `embedded-mariadb.js:57-64`
+
+```javascript
+start() {
+    this.username = require("os").userInfo().username;
+    if (this.username !== "node" && this.username !== "root") {
+        throw new Error("Embedded Mariadb supports only 'node' or 'root' user");
+    }
+}
+```
+
+- 容器中用户是 `node`，可以使用
+- 本地环境通常不是 `node`/`root`，无法使用
 
 ### 6.4 各种部署方式的真实代码分叉
 
@@ -744,25 +827,38 @@ node server/server.js
 
 代码中实际存在的分叉条件：
 
+#### 严格相等判断 (===)
+
 1. **`NODE_ENV === "development"` (isDev)**
    - dist/index.html 检查
    - Socket.io CORS 策略
    - 测试端点注册
    - 响应头 CORS
 
-2. **`UPTIME_KUMA_IS_CONTAINER === "1"`**
+2. **`UPTIME_KUMA_IS_CONTAINER === "1"` (B类)**
+   - 日志容器标识 (`server.js:66`)
+   - 前端容器标识 (`client.js:154`)
+
+3. **`UPTIME_KUMA_ENABLE_EMBEDDED_MARIADB === "1"`**
+   - 嵌入式 MariaDB 启用判断
+
+#### 真值判断 (if (env))
+
+4. **`process.env.UPTIME_KUMA_IS_CONTAINER` (A类)**
    - NSCD 服务启停
    - 浏览器可执行路径
-   - 嵌入式 MariaDB 用户检查
-   - 前端标识
+   - **注意**：任何非空字符串（包括 `"0"`、`"false"`）都会触发
 
-3. **`testMode` (--test 命令行参数)**
-   - SQLite journal_mode (MEMORY vs WAL)
-
-4. **`TEST_BACKEND` (环境变量)**
+5. **`process.env.TEST_BACKEND`**
    - 导出私有测试函数
    - 可模拟当前时间
    - 跳过统计数据存储
+   - **注意**：任何非空字符串都会触发
+
+#### 命令行参数
+
+6. **`testMode = !!args["test"]` (--test 命令行参数)**
+   - SQLite journal_mode (MEMORY vs WAL)
 
 ### 10.3 部署方式的本质
 
@@ -775,7 +871,26 @@ node server/server.js
 代码分叉只看"环境变量值"，不关心"是谁启动的"
 ```
 
-Uptime Kuma 的这种设计使得：
+### 10.4 重要警告：UPTIME_KUMA_IS_CONTAINER 判断不一致
+
+**代码中存在严重的判断不一致问题**：
+
+| 功能 | 判断方式 | `"1"` | `"0"` 或 `"false"` | `undefined` |
+|-----|---------|-------|-------------------|------------|
+| NSCD 服务启动 | `if (env)` | ✅ 启动 | ✅ 启动 | ❌ 不启动 |
+| 浏览器路径 | `if (env)` | ✅ 容器路径 | ✅ 容器路径 | ❌ 系统搜索 |
+| 日志容器标识 | `env === "1"` | ✅ 显示容器 | ❌ 不显示 | ❌ 不显示 |
+| 前端容器标识 | `env === "1"` | ✅ 显示容器 | ❌ 不显示 | ❌ 不显示 |
+
+**潜在问题**：
+- `UPTIME_KUMA_IS_CONTAINER=0` 或 `UPTIME_KUMA_IS_CONTAINER=false` → 会**错误触发** NSCD 和浏览器容器路径，但日志/前端显示为非容器
+- 这可能导致调试困难，因为实际行为与日志显示不一致
+
+**正确使用方式**：
+- 启用容器模式：`UPTIME_KUMA_IS_CONTAINER=1`
+- 禁用容器模式：**不设置**这个环境变量（不要设为 `"0"` 或 `"false"`）
+
+### 10.5 设计优点
 - 本地开发和生产环境的代码行为一致（仅由 `NODE_ENV` 控制）
 - Docker 容器只是添加了容器特定的优化（NSCD、预安装依赖）
 - PM2 等进程管理器完全透明，无需代码适配
