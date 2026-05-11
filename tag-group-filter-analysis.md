@@ -759,9 +759,11 @@ tag.value?.toLowerCase().includes(loweredSearchText)
 │           ↓                                                         │
 │  server.sendMonitorList(socket)                                     │
 │           ↓                                                         │
-│  this.getMonitorJSONList(userID)                                    │
+│  this.getMonitorJSONList(userID, monitorID = null)                  │
 │           ↓                                                         │
-│  R.findAll("monitor", ...)  ──→  获取所有监控记录                    │
+│  R.find("monitor",                                                  │
+│        "user_id = ? ... ORDER BY weight DESC, name",                │
+│        [userID, ...])  ──→  获取所有监控记录                        │
 │           ↓                                                         │
 │  Monitor.preparePreloadData(monitorData)                            │
 │           ↓                                                         │
