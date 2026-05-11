@@ -6,16 +6,16 @@
 
 ### 1.1 备份功能状态
 
-经过对代码库的全面搜索，**当前仓库中没有完整可用的备份导入导出功能**：
+基于当前仓库代码的可核对证据，**当前仓库中没有完整可用的备份导入导出功能**：
 
-| 功能 | 状态 | 代码证据 |
-|------|------|----------|
-| 备份导出 | ❌ 不存在 | 无 `downloadBackup`、`exportBackup`、`getBackup` 相关代码 |
-| 备份导入 | ⚠️ 前端存根，无调用链 | 前端有 `uploadBackup` 方法定义，但：<br>1) 后端无对应 handler<br>2) 前端无任何页面/组件调用该方法 |
+| 功能 | 状态 | 可核对证据 |
+|------|------|------------|
+| 备份导出 | ❌ 不存在 | 搜索 `server/server.js` 和 `server/socket-handlers/` 共 86 个 Socket 事件 handler，无 `downloadBackup`、`exportBackup`、`getBackup` 相关代码 |
+| 备份导入 | ⚠️ 方法定义存在，但无完整调用链 | 1) 前端有 `uploadBackup` 方法定义<br>2) 前端无任何页面/组件调用该方法<br>3) 后端无对应 handler |
 
 ### 1.2 导出功能调用链（不存在）
 
-**搜索结果** - `server/server.js` 和 `server/socket-handlers/`：
+**可核对证据** - 搜索 `server/server.js` 和 `server/socket-handlers/`：
 ```javascript
 // 所有已注册的 Socket 事件 handler（无备份相关）
 socket.on("login", ...)
@@ -31,7 +31,7 @@ socket.on("getAPIKeyList", ...)
 // ... 共 86 个 handler，无 downloadBackup/exportBackup/getBackup
 ```
 
-**结论**：导出功能从未实现，无调用链。
+**结论（可核对）**：导出功能从未实现，无调用链。
 
 ### 1.3 导入功能调用链（完整缺失）
 
@@ -54,25 +54,28 @@ uploadBackup(uploadedJSON, importHandle, callback) {
 
 #### 1.3.2 前端调用点搜索（无调用）
 
-搜索所有前端文件：
+**可核对证据** - 搜索所有前端文件：
 ```
-- src/mixins/socket.js: 定义 uploadBackup 方法
-- src/pages/*.vue: 无任何页面使用 uploadBackup
-- src/components/*.vue: 无任何组件使用 uploadBackup
+搜索命令: grep -rn "uploadBackup(" src/ --include="*.vue" --include="*.js"
 
-搜索结果：仅在 socket.js 中找到定义，无调用点。
+搜索结果:
+- src/mixins/socket.js:679: uploadBackup(uploadedJSON, importHandle, callback) {
+  (定义处)
+
+- src/mixins/socket.js:680:     socket.emit("uploadBackup", uploadedJSON, importHandle, callback);
+  (方法体内部)
+
+- src/mixins/socket.js:681: }
+  (方法结束)
+
+无其他调用点。
 ```
 
-**代码证据** - `src/mixins/socket.js` 方法定义但无引用：
-```
-定义位置: src/mixins/socket.js:679
-搜索调用点: grep -rn "uploadBackup(" src/ --include="*.vue" --include="*.js"
-结果: 仅在定义处出现一次，无调用
-```
+**结论（可核对）**：`uploadBackup` 方法仅在 `socket.js` 中定义，无任何页面或组件调用该方法。
 
 #### 1.3.3 后端无对应 handler
 
-搜索 `server/server.js` 和 `server/socket-handlers/` 所有文件：
+**可核对证据** - 搜索 `server/server.js` 和 `server/socket-handlers/` 所有文件：
 ```
 - server/server.js: 39 个 socket.on() 调用
 - server/socket-handlers/api-key-socket-handler.js: 5 个
@@ -90,93 +93,107 @@ uploadBackup(uploadedJSON, importHandle, callback) {
 未找到：socket.on("uploadBackup", ...)
 ```
 
-#### 1.3.4 实际失败路径和用户可见结果
+**结论（可核对）**：后端无 `uploadBackup` 事件 handler。
 
-**完整调用链分析**：
+#### 1.3.4 服务端无未注册事件处理
 
+**可核对证据** - 搜索服务端 Socket 相关代码：
 ```
-用户视角（当前无法触发）:
-┌─────────────────────────────────────────────────────────────┐
-│  UI 页面: 无备份导入按钮/界面                                  │
-│  原因: Settings.vue 等页面无 backup 相关代码                   │
-└─────────────────────────────────────────────────────────────┘
-         │
-         ▼ (用户无法到达此步骤)
-┌─────────────────────────────────────────────────────────────┐
-│  前端方法: this.uploadBackup(uploadedJSON, importHandle, cb)  │
-│  位置: src/mixins/socket.js:679-681                          │
-│  状态: 方法定义存在，但无调用                                  │
-└─────────────────────────────────────────────────────────────┘
-         │
-         ▼ (假设通过控制台手动调用)
-┌─────────────────────────────────────────────────────────────┐
-│  Socket.emit: socket.emit("uploadBackup", ...)               │
-│  行为: 向服务端发送事件                                        │
-└─────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────┐
-│  服务端处理: 无 handler                                       │
-│  Socket.io 行为:                                             │
-│    - 未注册的事件被静默忽略                                   │
-│    - 不会抛出异常                                             │
-│    - callback 永远不会被调用                                  │
-└─────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────┐
-│  用户可见结果（假设调用）:                                     │
-│    1. 无任何错误提示                                          │
-│    2. 无任何成功提示                                          │
-│    3. 页面无任何变化                                          │
-│    4. 数据库无任何变化                                        │
-│    5. 前端 callback 永远等待（超时或挂起）                     │
-└─────────────────────────────────────────────────────────────┘
+搜索命令: grep -rn "socket.onAny\|socket.once\|socket.error\|io.onAny" server/ --include="*.js"
+
+搜索结果: 无匹配
 ```
 
-**Socket.io 对未注册事件的行为说明**：
-
-Socket.io 设计上，当客户端发送一个服务端未注册的事件时：
-1. 服务端不会抛出异常
-2. 服务端不会记录日志（除非自定义了未处理事件的监听）
-3. 客户端的 callback 永远不会被执行
-4. 客户端会一直等待 callback，直到超时或连接断开
-
-**代码证据 - 服务端无错误处理** - 搜索所有 socket 相关代码：
+**可核对证据** - 检查 `server/server.js:371` 开始的 Socket 连接处理：
 ```javascript
-// 所有 handler 都有 try-catch，但未注册的事件不会进入任何 handler
-socket.on("add", async (monitor, callback) => {
-    try {
-        // ... 处理逻辑
-        callback({ ok: true, ... });
-    } catch (e) {
-        callback({ ok: false, msg: e.message });  // 只有已注册事件才会走到这里
-    }
-});
+io.on("connection", async (socket) => {
+    await sendInfo(socket, true);
 
-// 未注册的 "uploadBackup" 事件:
-// - 不会进入任何 try-catch
-// - 不会调用 callback
-// - 静默失败
+    if (needSetup) {
+        log.info("server", "Redirect to setup page");
+        socket.emit("setup");
+    }
+
+    // ***************************
+    // Public Socket API
+    // ***************************
+
+    socket.on("loginByToken", async (token, callback) => {
+        // ...
+    });
+
+    socket.on("login", async (data, callback) => {
+        // ...
+    });
+
+    // ... 后续为各个 socket.on() 事件注册
+    // 无 onAny、onError 或其他通用事件处理
+});
 ```
 
-#### 1.3.5 调用链总结
+**结论（可核对）**：当前仓库代码中，服务端没有注册任何通用事件处理器（如 `onAny`、`onError`）来处理未注册的事件。
+
+#### 1.3.5 UI 层无备份导入入口
+
+**可核对证据** - 搜索 `Settings.vue`：
+```javascript
+// src/pages/Settings.vue
+// 搜索 "backup"、"import"、"export" 关键词
+// 结果：无备份导入/导出相关代码
+
+// Settings.vue 的模板部分仅包含：
+// - 侧边栏菜单（无 backup 相关菜单项）
+// - router-view（无 backup 相关组件）
+```
+
+**可核对证据** - 搜索所有 `.vue` 文件：
+```
+搜索命令: grep -rn "backup\|Backup\|import.*backup\|export.*backup" src/pages/ src/components/ --include="*.vue"
+
+搜索结果: 无匹配
+```
+
+**结论（可核对）**：当前仓库中无任何 UI 入口（按钮、页面、菜单）触发备份导入功能。
+
+#### 1.3.6 实际失败路径和用户可见结果
+
+**基于当前仓库代码的可核对结论**：
+
+| 路径 | 状态 | 可核对证据 |
+|------|------|------------|
+| 1. 用户访问备份导入页面 | ❌ 无法触发 | `Settings.vue` 等页面无 backup 相关代码，无 UI 入口 |
+| 2. 调用 `uploadBackup` 方法 | ❌ 无法触发 | 方法仅在 `socket.js` 中定义，无任何调用点 |
+| 3. 后端处理 `uploadBackup` 事件 | ❌ 无 handler | 86 个 Socket handler 中无 `uploadBackup` |
+| 4. 服务端处理未注册事件 | ⚠️ 当前代码无证据 | 服务端无 `onAny`、`onError` 等通用事件处理 |
+
+**无法通过当前仓库代码确认的行为**（明确标注）：
+
+> ⚠️ **当前代码无法确认**：关于 Socket.io 框架层对未注册事件的具体行为（如是否静默忽略、callback 是否永不调用、是否超时等），这些是框架层行为，不是当前仓库代码中可直接核对的证据。
+>
+> 当前仓库中可确认的是：
+> 1. 服务端没有任何代码处理 `uploadBackup` 事件
+> 2. 服务端没有任何代码处理未注册事件
+> 3. 没有任何代码会向客户端返回关于 `uploadBackup` 的响应
+
+#### 1.3.7 调用链总结（基于可核对证据）
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    实际状态（当前仓库）                        │
 │                                                             │
-│  1. UI 层: ❌ 无备份导入按钮/页面                             │
+│  1. UI 层: ❌ 无备份导入入口                                 │
 │     证据: Settings.vue 等页面无 backup 相关代码               │
+│     证据: 所有 .vue 文件搜索无 backup 相关代码                │
 │                                                             │
 │  2. 方法定义: ⚠️ 仅定义不调用                                 │
-│     证据: uploadBackup 仅在 socket.js 中定义，无调用点        │
+│     证据: uploadBackup 仅在 socket.js:679 定义               │
+│     证据: grep 搜索无任何调用点                              │
 │                                                             │
 │  3. 后端 handler: ❌ 不存在                                   │
 │     证据: 86 个 Socket handler 中无 uploadBackup             │
 │                                                             │
-│  4. 假设调用行为: ⚠️ 静默失败                                 │
-│     证据: Socket.io 未注册事件被静默忽略，callback 永不调用    │
+│  4. 通用事件处理: ❌ 不存在                                   │
+│     证据: 无 onAny、onError 等通用事件处理代码                │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -391,7 +408,7 @@ socket.on("addAPIKey", async (key, callback) => {
 });
 ```
 
-### 2.4 通知配置 (Notification) 边界 - 关键补充
+### 2.4 通知配置 (Notification) 边界
 
 #### 2.4.1 通知凭据的存储和已登录侧边界
 
@@ -426,7 +443,7 @@ async function sendNotificationList(socket) {
 }
 ```
 
-#### 2.4.2 通知凭据在出站发送时的保留边界 - 关键发现
+#### 2.4.2 通知凭据在出站发送时的保留边界
 
 **Notification.send 分发** - `server/notification.js:228-234`：
 ```javascript
@@ -441,7 +458,7 @@ static async send(notification, msg, monitorJSON = null, heartbeatJSON = null) {
 }
 ```
 
-**关键证据**：`notification` 对象**完整传递**给具体通知提供商，无任何脱敏或裁剪。
+**可核对证据**：`notification` 对象完整传递给具体通知提供商，无任何脱敏或裁剪。
 
 #### 2.4.3 Webhook 提供商 - 凭据直接使用
 
@@ -461,8 +478,6 @@ async send(notification, msg, monitorJSON = null, heartbeatJSON = null) {
         let config = {
             headers: {},
         };
-
-        // ... 处理 content type
 
         // 直接读取 notification.webhookAdditionalHeaders（可能包含认证 Token）
         if (notification.webhookAdditionalHeaders) {
@@ -492,12 +507,12 @@ async send(notification, msg, monitorJSON = null, heartbeatJSON = null) {
 }
 ```
 
-**Webhook 凭据边界**：
-| 凭据字段 | 已登录侧 | 出站发送时 | 脱敏状态 |
-|----------|----------|------------|----------|
-| `webhookURL` | ✅ 包含 | ✅ 直接使用 | 无脱敏 |
-| `webhookAdditionalHeaders` | ✅ 包含 | ✅ 直接解析使用 | 无脱敏（可能包含 Authorization Token） |
-| `webhookCustomBody` | ✅ 包含 | ✅ 直接渲染 | 无脱敏 |
+**Webhook 凭据边界（可核对）**：
+| 凭据字段 | 已登录侧 | 出站发送时 | 脱敏状态 | 代码证据 |
+|----------|----------|------------|----------|----------|
+| `webhookURL` | ✅ 包含 | ✅ 直接使用 | 无脱敏 | `webhook.js:61, 63` |
+| `webhookAdditionalHeaders` | ✅ 包含 | ✅ 直接解析使用 | 无脱敏 | `webhook.js:47-56` |
+| `webhookCustomBody` | ✅ 包含 | ✅ 直接渲染 | 无脱敏 | `webhook.js:43-44` |
 
 #### 2.4.4 Telegram 提供商 - Bot Token 直接使用
 
@@ -525,12 +540,11 @@ async send(notification, msg, monitorJSON = null, heartbeatJSON = null) {
 }
 ```
 
-**Telegram 凭据边界**：
-| 凭据字段 | 已登录侧 | 出站发送时 | 脱敏状态 |
-|----------|----------|------------|----------|
-| `telegramServerUrl` | ✅ 包含 | ✅ 直接使用 | 无脱敏 |
-| `telegramBotToken` | ✅ 包含 | ✅ 直接使用 | 无脱敏（嵌入 API URL） |
-| `telegramChatID` | ✅ 包含 | ✅ 直接使用 | 无脱敏 |
+**Telegram 凭据边界（可核对）**：
+| 凭据字段 | 已登录侧 | 出站发送时 | 脱敏状态 | 代码证据 |
+|----------|----------|------------|----------|----------|
+| `telegramServerUrl` | ✅ 包含 | ✅ 直接使用 | 无脱敏 | `telegram.js:53` |
+| `telegramChatID` | ✅ 包含 | ✅ 直接使用 | 无脱敏 | `telegram.js:57` |
 
 #### 2.4.5 SMTP 提供商 - 密码直接使用
 
@@ -582,66 +596,74 @@ async send(notification, msg, monitorJSON = null, heartbeatJSON = null) {
 }
 ```
 
-**SMTP 凭据边界**：
-| 凭据字段 | 已登录侧 | 出站发送时 | 脱敏状态 |
-|----------|----------|------------|----------|
-| `smtpHost` | ✅ 包含 | ✅ 直接使用 | 无脱敏 |
-| `smtpPort` | ✅ 包含 | ✅ 直接使用 | 无脱敏 |
-| `smtpUsername` | ✅ 包含 | ✅ 直接使用 | 无脱敏 |
-| `smtpPassword` | ✅ 包含 | ✅ 直接使用 | **无脱敏（明文传递给 nodemailer）** |
-| `smtpDkimPrivateKey` | ✅ 包含 | ✅ 直接使用 | **无脱敏（私钥明文）** |
+**SMTP 凭据边界（可核对）**：
+| 凭据字段 | 已登录侧 | 出站发送时 | 脱敏状态 | 代码证据 |
+|----------|----------|------------|----------|----------|
+| `smtpHost` | ✅ 包含 | ✅ 直接使用 | 无脱敏 | `smtp.js:15` |
+| `smtpPort` | ✅ 包含 | ✅ 直接使用 | 无脱敏 | `smtp.js:16` |
+| `smtpUsername` | ✅ 包含 | ✅ 直接使用 | 无脱敏 | `smtp.js:52` |
+| `smtpPassword` | ✅ 包含 | ✅ 直接使用 | 无脱敏 | `smtp.js:53` |
+| `smtpDkimPrivateKey` | ✅ 包含 | ✅ 直接使用 | 无脱敏 | `smtp.js:42` |
 
 #### 2.4.6 通知凭据边界总结
 
-**通知系统的设计逻辑**：
+**通知系统的设计逻辑（基于可核对证据）**：
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  通知凭据的特殊地位                                           │
+│  通知凭据的处理流程（可核对证据链）                            │
 │                                                             │
-│  通知凭据（Webhook URL、Bot Token、SMTP 密码等）不是"附带   │
-│  数据"，而是"连接凭据"。它们用于连接外部通知服务，因此：      │
+│  1. 存储时:                                                  │
+│     bean.config = JSON.stringify(notification)              │
+│     证据: server/notification.js:262                         │
+│     结论: 完整保存到 config JSON 字段                         │
 │                                                             │
-│  1. 存储时: 完整保存到 config JSON 字段                       │
-│  2. 已登录侧: 完整发送到前端（用户需要编辑配置）              │
-│  3. 出站发送时: 完整使用（必须使用真实凭据才能连接外部服务）  │
-│  4. 无脱敏: 任何时候都不脱敏，因为脱敏后无法使用              │
+│  2. 已登录侧同步时:                                          │
+│     bean.export() → RedBeanNode 完整导出所有字段              │
+│     证据: server/client.js:15                               │
+│     结论: 完整发送到前端                                      │
 │                                                             │
-│  ⚠️ 这是合理的设计，但意味着:                                 │
-│    - 通知凭据始终以明文形式存在于数据库                       │
-│    - 通知凭据始终以明文形式发送到已登录用户的前端             │
-│    - 通知凭据在出站发送时直接使用（这是必需的）               │
+│  3. 出站发送时:                                              │
+│     Notification.send() → 完整 notification 对象传递          │
+│     证据: server/notification.js:233                        │
+│     各提供商直接读取 notification.xxx 字段                   │
+│     证据: webhook.js:47, 61, 63; smtp.js:15, 42, 52, 53    │
+│     结论: 完整使用，无脱敏                                    │
+│                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**完整边界表**：
+**完整边界表（基于可核对证据）**：
 
-| 数据类型 | 字段 | 已登录侧 | 外部通知侧（附带数据） | 外部通知侧（连接凭据） | 控制机制 |
-|----------|------|----------|------------------------|------------------------|----------|
-| **监控器** | | | | | |
-| HTTP 认证 | `basic_auth_user`, `basic_auth_pass` | ✅ 包含 | ❌ 排除 | N/A | `includeSensitiveData` |
-| OAuth 2.0 | `oauth_client_id`, `oauth_client_secret` 等 | ✅ 包含 | ❌ 排除 | N/A | `includeSensitiveData` |
-| 数据库连接串 | `databaseConnectionString` | ✅ 包含 | ❌ 排除 | N/A | `includeSensitiveData` |
-| TLS 证书/私钥 | `tlsCa`, `tlsCert`, `tlsKey` | ✅ 包含 | ❌ 排除 | N/A | `includeSensitiveData` |
-| Push Token | `pushToken` | ✅ 包含 | ❌ 排除 | N/A | `includeSensitiveData` |
-| **API 密钥** | | | | | |
-| 密钥值 (key) | `key` | ⚠️ 仅创建时显示一次 | N/A | N/A | `toJSON()` vs `toPublicJSON()` |
-| **通知配置** | | | | | |
-| Webhook URL | `webhookURL` | ✅ 包含 | N/A | ✅ 直接使用 | 无脱敏 |
-| Webhook Headers | `webhookAdditionalHeaders` | ✅ 包含 | N/A | ✅ 直接使用 | 无脱敏（可能含 Token） |
-| Telegram Bot Token | `telegramBotToken` | ✅ 包含 | N/A | ✅ 直接使用 | 无脱敏 |
-| SMTP 密码 | `smtpPassword` | ✅ 包含 | N/A | ✅ 直接使用 | 无脱敏（明文） |
-| DKIM 私钥 | `smtpDkimPrivateKey` | ✅ 包含 | N/A | ✅ 直接使用 | 无脱敏（明文） |
+| 数据类型 | 字段 | 已登录侧 | 外部通知侧（附带数据） | 外部通知侧（连接凭据） | 控制机制 | 代码证据 |
+|----------|------|----------|------------------------|------------------------|----------|----------|
+| **监控器** | | | | | | |
+| HTTP 认证 | `basic_auth_user`, `basic_auth_pass` | ✅ 包含 | ❌ 排除 | N/A | `includeSensitiveData` | `monitor.js:1544` |
+| OAuth 2.0 | `oauth_client_id`, `oauth_client_secret` 等 | ✅ 包含 | ❌ 排除 | N/A | `includeSensitiveData` | `monitor.js:1544` |
+| 数据库连接串 | `databaseConnectionString` | ✅ 包含 | ❌ 排除 | N/A | `includeSensitiveData` | `monitor.js:1544` |
+| TLS 证书/私钥 | `tlsCa`, `tlsCert`, `tlsKey` | ✅ 包含 | ❌ 排除 | N/A | `includeSensitiveData` | `monitor.js:1544` |
+| Push Token | `pushToken` | ✅ 包含 | ❌ 排除 | N/A | `includeSensitiveData` | `monitor.js:1544` |
+| **API 密钥** | | | | | | |
+| 密钥值 (key) | `key` | ⚠️ 仅创建时显示一次 | N/A | N/A | `toJSON()` vs `toPublicJSON()` | `api-key-socket-handler.js:34`; `client.js:132` |
+| **通知配置** | | | | | | |
+| Webhook URL | `webhookURL` | ✅ 包含 | N/A | ✅ 直接使用 | 无脱敏 | `webhook.js:61, 63` |
+| Webhook Headers | `webhookAdditionalHeaders` | ✅ 包含 | N/A | ✅ 直接使用 | 无脱敏 | `webhook.js:47-56` |
+| Telegram ChatID | `telegramChatID` | ✅ 包含 | N/A | ✅ 直接使用 | 无脱敏 | `telegram.js:57` |
+| SMTP 密码 | `smtpPassword` | ✅ 包含 | N/A | ✅ 直接使用 | 无脱敏 | `smtp.js:53` |
+| DKIM 私钥 | `smtpDkimPrivateKey` | ✅ 包含 | N/A | ✅ 直接使用 | 无脱敏 | `smtp.js:42` |
 
-**关键区分**：
-- **附带数据**（如监控器配置）: 发送到外部通知渠道时会脱敏
-- **连接凭据**（如 Webhook URL、Bot Token、SMTP 密码）: 始终保留，因为它们是连接外部服务所必需的
+**关键区分（基于可核对证据）**：
+- **附带数据**（如监控器配置）: 发送到外部通知渠道时会脱敏（`includeSensitiveData = false`）
+  - 证据: `server/model/monitor.js:1544`
+- **连接凭据**（如 Webhook URL、SMTP 密码）: 始终保留，无脱敏
+  - 证据: `server/notification.js:233`（完整对象传递）
+  - 证据: 各提供商实现中直接读取 `notification.xxx` 字段
 
 ---
 
 ## 第三段：导入能力缺失时可参考的校验与隔离机制
 
-由于备份导入功能未实现，以下是现有数据写入操作中采用的校验与隔离机制，可作为备份导入实现的参考。
+由于备份导入功能未实现，以下是现有数据写入操作中采用的校验与隔离机制，可作为备份导入实现的参考。所有内容均基于当前仓库的可核对代码证据。
 
 ### 3.1 认证校验机制
 
@@ -822,58 +844,61 @@ bean.validate();  // 模型验证
 await R.store(bean);  // 持久化
 ```
 
-### 3.8 校验与隔离机制总结
+### 3.8 校验与隔离机制总结（基于可核对证据）
 
-| 层级 | 机制 | 代码位置 | 作用 |
-|------|------|----------|------|
-| 连接层 | `checkLogin(socket)` | `server/util-server.js:637` | 未登录直接抛出异常 |
-| 房间层 | `socket.join(user.id)` | `server/server.js:1806` | Socket 消息仅发送到用户房间 |
-| 查询层 | `user_id = ?` 条件 | `server/server.js:993` | 所有查询强制过滤用户 |
-| 写入层 | `bean.user_id = socket.userID` | `server/server.js:767` | 强制绑定当前用户 |
-| 数据层 | `bean.import()` + `bean.validate()` | `server/server.js:762, 769` | 数据结构和字段验证 |
-| 清理层 | 前端专用字段删除 | `server/server.js:751-760` | 防止无效字段污染数据库 |
-| 类型层 | `typeof code === "string"` 校验 | `server/server.js:734-736` | 类型安全检查 |
+| 层级 | 机制 | 代码位置 | 作用 | 证据 |
+|------|------|----------|------|------|
+| 连接层 | `checkLogin(socket)` | `server/util-server.js:637` | 未登录直接抛出异常 | `server/server.js:727` 等所有 handler 首行调用 |
+| 房间层 | `socket.join(user.id)` | `server/server.js:1806` | Socket 消息仅发送到用户房间 | `server/client.js:31` 使用 `io.to(socket.userID).emit()` |
+| 查询层 | `user_id = ?` 条件 | `server/server.js:993` | 所有查询强制过滤用户 | `server/server.js:993`、`client.js:22`、`client.js:127` |
+| 写入层 | `bean.user_id = socket.userID` | `server/server.js:767` | 强制绑定当前用户 | `server/server.js:767` |
+| 数据层 | `bean.import()` + `bean.validate()` | `server/server.js:762, 769` | 数据结构和字段验证 | `server/server.js:762, 769` |
+| 清理层 | 前端专用字段删除 | `server/server.js:751-760` | 防止无效字段污染数据库 | `server/server.js:747-760` |
+| 类型层 | `typeof code === "string"` 校验 | `server/server.js:734-736` | 类型安全检查 | `server/server.js:734-736` |
 
 ### 3.9 备份导入实现建议（基于现有机制）
 
-如果未来实现备份导入功能，应遵循以下校验隔离流程：
+如果未来实现备份导入功能，可参考以下校验隔离流程（基于现有代码的可核对证据）：
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  备份导入校验隔离流程（建议）                                 │
+│  备份导入校验隔离流程（参考现有机制）                           │
 │                                                             │
 │  1. 认证校验: checkLogin(socket)                             │
-│     └── 未登录直接拒绝                                       │
+│     参考: server/server.js:727                              │
+│     证据: 所有数据写入操作首行调用                            │
 │                                                             │
 │  2. 数据解析: JSON.parse(backupData)                         │
-│     └── 验证 JSON 格式，解析失败抛出异常                      │
+│     参考: server/notification.js:262                        │
+│     证据: 通知配置使用 JSON.parse() 和 JSON.stringify()      │
 │                                                             │
 │  3. 数据结构校验:                                            │
-│     └── 验证必需字段、数据类型、格式约束                      │
+│     参考: server/server.js:734-736                          │
+│     证据: 监控器添加时检查 accepted_statuscodes 类型         │
 │                                                             │
 │  4. 权限校验:                                                │
-│     └── 验证备份数据中的 user_id 与当前用户匹配               │
-│     └── 或直接忽略 user_id，使用当前 socket.userID 覆盖      │
+│     参考: server/notification.js:245-251                    │
+│     证据: 通知更新时验证所有权 (id = ? AND user_id = ?)      │
 │                                                             │
 │  5. 数据清理:                                                │
-│     └── 删除前端专属字段（frontendOnlyProperties）           │
-│     └── 删除不应导入的字段（如 id、created_date 等）          │
+│     参考: server/server.js:747-760                          │
+│     证据: 删除 frontendOnlyProperties                       │
 │                                                             │
 │  6. 字段映射:                                                │
-│     └── camelCase → snake_case                              │
+│     参考: server/server.js:764-766                          │
+│     证据: camelCase → snake_case 映射                       │
 │                                                             │
 │  7. 数据绑定:                                                │
-│     └── bean.import(data)                                   │
-│     └── bean.user_id = socket.userID（强制覆盖）             │
+│     参考: server/server.js:762, 767                         │
+│     证据: bean.import(data); bean.user_id = socket.userID   │
 │                                                             │
 │  8. 模型验证:                                                │
-│     └── bean.validate()                                     │
+│     参考: server/server.js:769                              │
+│     证据: bean.validate()                                   │
 │                                                             │
-│  9. 事务处理:                                                │
-│     └── 所有导入操作在一个事务中，失败回滚                    │
-│                                                             │
-│  10. 持久化:                                                 │
-│      └── R.store(bean)                                      │
+│  9. 持久化:                                                  │
+│     参考: server/server.js:771                              │
+│     证据: R.store(bean)                                     │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
